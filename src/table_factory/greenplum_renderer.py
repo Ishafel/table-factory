@@ -60,10 +60,12 @@ def render_greenplum_create_external(
         f"CREATE EXTERNAL TABLE {qualified} (\n"
         f"{_mapped_column_definitions(plan)}\n"
         ")\n"
-        f"LOCATION ({greenplum_string(_external_location(plan, config))})\n"
-        f"FORMAT {greenplum_string(external.format.kind.upper())} (\n"
-        f"  FORMATTER = {greenplum_string(external.format.formatter)}\n"
-        ");\n"
+        "LOCATION (\n"
+        f"  {greenplum_string(_external_location(plan, config))}\n"
+        ") ON ALL\n"
+        f"FORMAT {greenplum_string(external.format.kind.upper())} "
+        f"(FORMATTER={greenplum_string(external.format.formatter)})\n"
+        "ENCODING 'UTF8';\n"
     )
     comments = _comments(plan, schema=schema, table=table)
     return rendered if not comments else f"{rendered}\n{comments}\n"

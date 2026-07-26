@@ -199,10 +199,12 @@ def test_large_fixture_generates_exact_five_role_chain_deterministically(
         f'CREATE EXTERNAL TABLE "ext"."large_table_ext" (\n{greenplum_definitions}\n)'
     ) in greenplum_external
     assert (
-        "LOCATION ('pxf://target_hive_db.large_table_physical?PROFILE=Hive&SERVER=default')"
+        "LOCATION (\n"
+        "  'pxf://target_hive_db.large_table_physical?PROFILE=hive&SERVER=default'\n"
+        ") ON ALL\n"
+        "FORMAT 'CUSTOM' (FORMATTER='pxfwritable_import')\n"
+        "ENCODING 'UTF8';"
     ) in greenplum_external
-    assert "FORMAT 'CUSTOM'" in greenplum_external
-    assert "FORMATTER = 'pxfwritable_import'" in greenplum_external
     assert "sample_source" not in greenplum_external
     assert "target_gp_database" not in greenplum_external
 
@@ -322,7 +324,7 @@ def test_comments_and_partition_columns_are_flattened_and_escaped(
     ) in greenplum_create
     assert ('COMMENT ON COLUMN "dwh"."events"."event_day" IS \'День события\';') in greenplum_create
     assert (
-        "pxf://target_hive_db.events_physical?PROFILE=Hive&SERVER=default"
+        "pxf://target_hive_db.events_physical?PROFILE=hive&SERVER=default"
     ) in greenplum_external
     assert (
         f'(\n{greenplum_identifiers}\n)\nSELECT\n{greenplum_identifiers}\nFROM "ext"."events_ext";'

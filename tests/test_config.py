@@ -40,7 +40,7 @@ VALID_CONFIG: dict[str, Any] = {
             "location_template": (
                 "pxf://{hive_database}.{hive_table}?PROFILE={profile}&SERVER={server}"
             ),
-            "profile": "Hive",
+            "profile": "hive",
             "server": "default",
             "format": {
                 "kind": "custom",
@@ -119,7 +119,7 @@ def test_version_2_configuration_loads_all_supported_settings(
     assert config.greenplum.external.location_template == (
         "pxf://{hive_database}.{hive_table}?PROFILE={profile}&SERVER={server}"
     )
-    assert config.greenplum.external.profile == "Hive"
+    assert config.greenplum.external.profile == "hive"
     assert config.greenplum.external.server == "default"
     assert config.greenplum.external.format.kind == "custom"
     assert config.greenplum.external.format.formatter == "pxfwritable_import"
@@ -521,7 +521,7 @@ def test_configuration_rejects_unsupported_hive_storage(
     [
         (
             "HdfsTextSimple",
-            "must be 'Hive' for the supported textfile/Hive workflow",
+            "must be 'hive' for the supported textfile/Hive workflow",
         ),
         (
             "Hive;DROP",
@@ -541,7 +541,7 @@ def test_configuration_rejects_unsupported_or_unsafe_external_profiles(
         _load(tmp_path, _changed("greenplum.external.profile", profile))
 
 
-def test_supported_external_profile_is_rendered_with_canonical_case(
+def test_supported_external_profile_is_rendered_in_canonical_lowercase(
     tmp_path: Path,
 ) -> None:
     config = _load(
@@ -549,7 +549,7 @@ def test_supported_external_profile_is_rendered_with_canonical_case(
         _changed("greenplum.external.profile", "hIVE"),
     )
 
-    assert config.greenplum.external.profile == "Hive"
+    assert config.greenplum.external.profile == "hive"
 
 
 @pytest.mark.parametrize(

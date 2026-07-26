@@ -90,7 +90,7 @@ class GreenplumExternalFormatConfig:
 @dataclass(frozen=True, slots=True)
 class GreenplumExternalConfig:
     location_template: str = "pxf://{hive_database}.{hive_table}?PROFILE={profile}&SERVER={server}"
-    profile: str = "Hive"
+    profile: str = "hive"
     server: str = "default"
     format: GreenplumExternalFormatConfig = field(default_factory=GreenplumExternalFormatConfig)
 
@@ -427,9 +427,9 @@ def _load_external(raw_value: object) -> GreenplumExternalConfig:
         raise ConfigurationError("greenplum.external.profile contains unsafe characters")
     if requested_profile.casefold() != "hive":
         raise ConfigurationError(
-            "greenplum.external.profile must be 'Hive' for the supported textfile/Hive workflow"
+            "greenplum.external.profile must be 'hive' for the supported textfile/Hive workflow"
         )
-    profile = "Hive"
+    profile = "hive"
     if _SAFE_TOKEN.fullmatch(server) is None:
         raise ConfigurationError("greenplum.external.server contains unsafe characters")
     return GreenplumExternalConfig(

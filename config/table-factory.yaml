@@ -24,7 +24,7 @@ greenplum:
     mode: random
   external:
     location_template: "pxf://{hive_database}.{hive_table}?PROFILE={profile}&SERVER={server}"
-    profile: Hive
+    profile: hive
     server: default
     format:
       kind: custom

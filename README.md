@@ -248,7 +248,7 @@ columns явно и в том же порядке. `SELECT *` не исполь�
 Для стандартной конфигурации и `customer_orders` получится:
 
 ```text
-pxf://target_hive_db.customer_orders_physical?PROFILE=Hive&SERVER=default
+pxf://target_hive_db.customer_orders_physical?PROFILE=hive&SERVER=default
 ```
 
 Location template хранится в config, но его структура фиксирована validator:
@@ -258,14 +258,18 @@ parameters и profiles текущая schema не принимает. End-to-end
 разрешает только Hive profile и:
 
 ```sql
-FORMAT 'CUSTOM' (
-  FORMATTER = 'pxfwritable_import'
-)
+LOCATION (
+  'pxf://target_hive_db.customer_orders_physical?PROFILE=hive&SERVER=default'
+) ON ALL
+FORMAT 'CUSTOM' (FORMATTER='pxfwritable_import')
+ENCODING 'UTF8';
 ```
 
 Это согласовано с чтением настроенной Hive `TEXTFILE`-таблицы через PXF Hive
-profile. Другие сочетания storage/profile/external format отклоняются, чтобы
-не создавать правдоподобный, но неподдержанный SQL.
+profile. `ON ALL` и UTF-8 encoding являются фиксированной частью
+сгенерированного Greenplum external DDL. Другие сочетания
+storage/profile/external format отклоняются, чтобы не создавать
+правдоподобный, но неподдержанный SQL.
 
 ### 4. Greenplum physical table
 
@@ -418,7 +422,7 @@ greenplum:
     mode: random
   external:
     location_template: "pxf://{hive_database}.{hive_table}?PROFILE={profile}&SERVER={server}"
-    profile: Hive
+    profile: hive
     server: default
     format:
       kind: custom
@@ -449,7 +453,7 @@ Version 1 несовместима с новым workflow и не получае
 | `greenplum.physical_table_name_template` | безопасный name template | Имя physical table |
 | `greenplum.distribution.mode` | только `random` | `DISTRIBUTED RANDOMLY` |
 | `greenplum.external.location_template` | безопасный `pxf://...` template | PXF LOCATION новой Hive table |
-| `greenplum.external.profile` | только `Hive`; регистр input не учитывается, effective value нормализуется в `Hive` | PXF profile поддержанного workflow |
+| `greenplum.external.profile` | только `hive`; регистр input не учитывается, effective value нормализуется в `hive` | PXF profile поддержанного workflow |
 | `greenplum.external.server` | ASCII token `[A-Za-z0-9_][A-Za-z0-9_.-]*` | Имя PXF server целевой среды |
 | `greenplum.external.format.kind` | только `custom` | Greenplum external format |
 | `greenplum.external.format.formatter` | только `pxfwritable_import` | PXF custom formatter |
@@ -462,8 +466,8 @@ Greenplum database, schema, вычисленные table names и column names �
 Значения `hive.storage.format`, `hive.insert_mode`,
 `greenplum.distribution.mode`, `greenplum.external.format.kind` и
 `greenplum.external.format.formatter` принимаются без учёта регистра и
-нормализуются в lowercase. Profile нормализуется отдельно в каноническое
-значение `Hive`.
+нормализуются в lowercase. Profile также нормализуется в каноническое
+значение `hive`.
 
 Name templates разрешают literal-фрагменты только из ASCII
 `[A-Za-z0-9_]*` и placeholders:
@@ -735,6 +739,8 @@ wheel-вариант CLI не подключается к target systems.
   структура URI, profile, formatter или дополнительные параметры. Если
   deployment требует другой контракт, текущую schema и renderer нужно
   расширить; сгенерированный SQL необходимо проверить в целевой среде.
+- Clause `LOCATION (...) ON ALL` зафиксирован для целевого Greenplum/ADB
+  dialect. Он не универсален для всех версий и дистрибутивов Greenplum.
 - Утилита не проверяет содержимое строк на совместимость с выбранными
   delimiter, escape и null marker.
 - Source modifiers, constraints, partitioning, storage, `LOCATION`, properties,
