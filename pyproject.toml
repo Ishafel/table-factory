@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "table-factory"
 version = "0.1.0"
-description = "Generate deterministic SQL artifacts from Hive CREATE TABLE statements."
+description = "Generate offline Hive-to-Greenplum transfer SQL from Hive table DDL."
 readme = "README.md"
 requires-python = ">=3.12"
 license = "Apache-2.0"

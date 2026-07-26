@@ -1,6 +1,31 @@
-version: 1
-dialect: hive
+version: 2
 
 output:
   include_source_comment: true
   filename_separator: "__"
+
+hive:
+  target_database: target_hive_db
+  physical_table_name_template: "{source_table}_physical"
+  insert_mode: into
+  storage:
+    format: textfile
+    field_delimiter: ","
+    escape_character: "\\"
+    null_value: "\\N"
+
+greenplum:
+  database: target_gp_database
+  external_schema: ext
+  physical_schema: dwh
+  external_table_name_template: "{source_table}_ext"
+  physical_table_name_template: "{source_table}"
+  distribution:
+    mode: random
+  external:
+    location_template: "pxf://{hive_database}.{hive_table}?PROFILE={profile}&SERVER={server}"
+    profile: Hive
+    server: default
+    format:
+      kind: custom
+      formatter: pxfwritable_import

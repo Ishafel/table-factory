@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -14,16 +15,29 @@ from table_factory.generator import (
     render_artifacts,
     write_artifacts,
 )
-from table_factory.models import Table
+from table_factory.models import Table, TablePlan
+from table_factory.naming import build_target_names
 from table_factory.parser import parse_hive_ddl
+from table_factory.path_safety import has_untrusted_symlink_component
+from table_factory.type_mapper import map_table_columns
 
 
 @dataclass(frozen=True, slots=True)
 class ParsedFile:
     """Tables parsed from one input document."""
 
+    path: Path
     label: str
     tables: tuple[Table, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedWorkflow:
+    """A fully validated workflow whose artifacts are safe to write."""
+
+    parsed_files: tuple[ParsedFile, ...]
+    plans: tuple[TablePlan, ...]
+    artifacts: tuple[Artifact, ...]
 
 
 def display_path(path: Path, *, cwd: Path) -> str:
@@ -48,11 +62,17 @@ def resolve_from_cwd(value: str, *, cwd: Path) -> Path:
     return candidate
 
 
+def _reject_input_symlink_components(input_path: Path, *, label: str) -> None:
+    if has_untrusted_symlink_component(input_path):
+        raise TableFactoryError(f"input path must not contain a symbolic-link component: {label}")
+
+
 def discover_sql_files(input_path: Path, *, cwd: Path) -> tuple[Path, ...]:
     """Find SQL inputs deterministically without depending on the host path."""
     label = display_path(input_path, cwd=cwd)
-    if input_path.is_symlink():
+    if input_path.is_symlink() and has_untrusted_symlink_component(input_path):
         raise TableFactoryError(f"input path must not be a symbolic link: {label}")
+    _reject_input_symlink_components(input_path, label=label)
     if input_path.is_file():
         if input_path.suffix.lower() != ".sql":
             raise TableFactoryError(f"input file is not SQL: {label}")
@@ -111,7 +131,8 @@ def parse_files(input_path: Path, *, cwd: Path) -> tuple[ParsedFile, ...]:
     for path in discover_sql_files(input_path, cwd=cwd):
         label = display_path(path, cwd=cwd)
         try:
-            sql = path.read_text(encoding="utf-8")
+            real_path = path.resolve(strict=True)
+            sql = real_path.read_text(encoding="utf-8")
         except (OSError, UnicodeError) as error:
             detail = getattr(error, "strerror", None) or "invalid UTF-8"
             raise TableFactoryError(f"cannot read input {label}: {detail}") from None
@@ -119,8 +140,105 @@ def parse_files(input_path: Path, *, cwd: Path) -> tuple[ParsedFile, ...]:
             tables = parse_hive_ddl(sql)
         except DdlParseError as error:
             raise DdlParseError(f"{label}: {error}") from None
-        parsed.append(ParsedFile(label=label, tables=tables))
+        parsed.append(ParsedFile(path=real_path, label=label, tables=tables))
     return tuple(parsed)
+
+
+def _comparison(value: str) -> str:
+    return unicodedata.normalize("NFKC", value).casefold()
+
+
+def _ensure_unique_targets(plans: tuple[TablePlan, ...]) -> None:
+    qualified_hive_sources: dict[tuple[str, str], str] = {}
+    unqualified_hive_sources: dict[str, str] = {}
+    for plan in plans:
+        source = plan.source
+        if source.database is None:
+            unqualified_hive_sources.setdefault(
+                _comparison(source.name),
+                source.qualified_name,
+            )
+        else:
+            qualified_hive_sources.setdefault(
+                (_comparison(source.database), _comparison(source.name)),
+                source.qualified_name,
+            )
+
+    hive_targets: dict[tuple[str, str], str] = {}
+    greenplum_targets: dict[str, str] = {}
+    for plan in plans:
+        hive_name = plan.targets.hive_qualified_name
+        hive_key = (
+            _comparison(plan.targets.hive_database),
+            _comparison(plan.targets.hive_table),
+        )
+        if hive_key in hive_targets:
+            raise TableFactoryError(
+                "multiple source tables map to the same Hive target: "
+                f"{hive_targets[hive_key]} and {hive_name}"
+            )
+        hive_targets[hive_key] = hive_name
+
+        colliding_source = qualified_hive_sources.get(hive_key)
+        if colliding_source is None:
+            colliding_source = unqualified_hive_sources.get(hive_key[1])
+        if colliding_source is not None:
+            raise TableFactoryError(
+                f"generated Hive target {hive_name} would collide with "
+                f"source Hive table {colliding_source} in the input batch"
+            )
+
+        for greenplum_name in (
+            plan.targets.greenplum_external_qualified_name,
+            plan.targets.greenplum_physical_qualified_name,
+        ):
+            greenplum_key = _comparison(greenplum_name)
+            if greenplum_key in greenplum_targets:
+                raise TableFactoryError(
+                    "multiple generated tables map to the same Greenplum target: "
+                    f"{greenplum_targets[greenplum_key]} and {greenplum_name}"
+                )
+            greenplum_targets[greenplum_key] = greenplum_name
+
+
+def prepare(
+    input_path: Path,
+    *,
+    config: FactoryConfig,
+    cwd: Path,
+) -> PreparedWorkflow:
+    """Parse, semantically validate, render, and collision-check all inputs."""
+    parsed_files = parse_files(input_path, cwd=cwd)
+
+    planned: list[TablePlan] = []
+    for parsed_file in parsed_files:
+        for table in parsed_file.tables:
+            planned.append(
+                TablePlan(
+                    source_label=parsed_file.label,
+                    source=table,
+                    targets=build_target_names(table, config),
+                    mapped_columns=map_table_columns(table),
+                )
+            )
+    plans = tuple(planned)
+    _ensure_unique_targets(plans)
+
+    rendered: list[Artifact] = []
+    for plan in plans:
+        rendered.extend(
+            render_artifacts(
+                plan,
+                config=config,
+                source_label=plan.source_label,
+            )
+        )
+    ensure_unique_artifacts(rendered)
+    return PreparedWorkflow(
+        parsed_files=parsed_files,
+        plans=plans,
+        artifacts=tuple(rendered),
+    )
 
 
 def generate(
@@ -131,17 +249,10 @@ def generate(
     cwd: Path,
 ) -> int:
     """Parse all inputs, then atomically write their generated artifacts."""
-    parsed_files = parse_files(input_path, cwd=cwd)
-    artifacts: list[Artifact] = []
-    for parsed_file in parsed_files:
-        for table in parsed_file.tables:
-            artifacts.extend(
-                render_artifacts(
-                    table,
-                    config=config,
-                    source_label=Path(parsed_file.label).name,
-                )
-            )
-    ensure_unique_artifacts(artifacts)
-    write_artifacts(output_path, artifacts)
-    return len(artifacts)
+    prepared = prepare(input_path, config=config, cwd=cwd)
+    write_artifacts(
+        output_path,
+        list(prepared.artifacts),
+        input_paths=tuple(parsed_file.path for parsed_file in prepared.parsed_files),
+    )
+    return len(prepared.artifacts)

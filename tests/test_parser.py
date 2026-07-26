@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 
 from table_factory.config import FactoryConfig
 from table_factory.errors import DdlParseError, TableFactoryError
 from table_factory.generator import ensure_unique_artifacts, render_artifacts
 from table_factory.parser import parse_hive_ddl
+from table_factory.sql import hive_string
 
 
 def test_create_table_text_inside_comment_literal_is_not_a_second_table() -> None:
@@ -54,6 +57,25 @@ def test_doubled_identifier_quotes_are_unescaped() -> None:
 
     assert table.name == "sales`daily"
     assert table.columns[0].name == "order`id"
+
+
+def test_hive_comment_escapes_are_decoded_and_rendered_losslessly() -> None:
+    ddl = (
+        r"CREATE TABLE escaped (value STRING COMMENT "
+        r"'\Z|\%|\_|\u0416|\101|\f|\uD83D\uDE00|\u000c');"
+    )
+
+    comment = parse_hive_ddl(ddl)[0].columns[0].comment
+
+    assert comment == "\x1a|\\%|\\_|Ж|A|f|😀|\f"
+    assert hive_string(comment) == r"'\Z|\%|\_|Ж|A|f|😀|\u000c'"
+
+
+def test_unpaired_unicode_surrogate_in_comment_is_rejected() -> None:
+    ddl = r"CREATE TABLE escaped (value STRING COMMENT '\uD83D');"
+
+    with pytest.raises(DdlParseError, match="invalid Unicode surrogate escape"):
+        parse_hive_ddl(ddl)
 
 
 @pytest.mark.parametrize(
@@ -116,6 +138,8 @@ def test_hive_comments_and_column_constraints_are_accepted() -> None:
         "status",
         "price",
     ]
+    assert table.external is True
+    assert table.columns[1].comment == "required"
 
 
 def test_table_clauses_are_validated_and_preserved_verbatim() -> None:
@@ -132,6 +156,9 @@ def test_table_clauses_are_validated_and_preserved_verbatim() -> None:
     table = parse_hive_ddl(ddl)[0]
 
     assert table.create_sql == ddl
+    assert table.external is True
+    assert table.comment == "events table"
+    assert [column.name for column in table.partition_columns] == ["event_day"]
 
 
 @pytest.mark.parametrize(
@@ -222,10 +249,22 @@ def test_artifact_names_are_portable_across_case_insensitive_filesystems() -> No
 def test_long_unicode_table_name_stays_within_filesystem_component_limit() -> None:
     table_name = "表" * 120
     table = parse_hive_ddl(f"CREATE TABLE `{table_name}` (id INT);")[0]
+    default = FactoryConfig()
+    config = FactoryConfig(
+        hive=replace(
+            default.hive,
+            physical_table_name_template="safe_hive_target",
+        ),
+        greenplum=replace(
+            default.greenplum,
+            external_table_name_template="safe_external_target",
+            physical_table_name_template="safe_physical_target",
+        ),
+    )
 
     artifacts = render_artifacts(
         table,
-        config=FactoryConfig(),
+        config=config,
         source_label="line\nbreak.sql",
     )
 

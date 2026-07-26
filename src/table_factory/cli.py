@@ -13,7 +13,7 @@ from table_factory.errors import TableFactoryError
 from table_factory.workflow import (
     display_path,
     generate,
-    parse_files,
+    prepare,
     resolve_from_cwd,
 )
 
@@ -21,7 +21,9 @@ from table_factory.workflow import (
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="table-factory",
-        description="Generate deterministic SQL artifacts from Hive DDL.",
+        description=(
+            "Generate deterministic Hive-to-Greenplum transfer SQL from read-only Hive DDL."
+        ),
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -72,21 +74,19 @@ def _run(arguments: argparse.Namespace, *, cwd: Path) -> int:
 
     if arguments.command == "validate":
         input_path = resolve_from_cwd(arguments.input_path, cwd=cwd)
-        parsed = parse_files(input_path, cwd=cwd)
-        table_count = sum(len(document.tables) for document in parsed)
-        print(f"Validated {table_count} table(s) in {len(parsed)} file(s).")
+        prepared = prepare(input_path, config=config, cwd=cwd)
+        print(f"Validated {len(prepared.plans)} table(s) in {len(prepared.parsed_files)} file(s).")
         return 0
 
     if arguments.command == "inspect":
         ddl_path = resolve_from_cwd(arguments.ddl_path, cwd=cwd)
         if not ddl_path.is_file():
             raise TableFactoryError("inspect requires one SQL file")
-        parsed = parse_files(ddl_path, cwd=cwd)
-        document = parsed[0]
+        prepared = prepare(ddl_path, config=config, cwd=cwd)
         payload = {
-            "source": document.label,
+            "source": prepared.parsed_files[0].label,
             "config": config.as_dict(),
-            "tables": [table.as_dict() for table in document.tables],
+            "tables": [plan.as_dict() for plan in prepared.plans],
         }
         print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
         return 0

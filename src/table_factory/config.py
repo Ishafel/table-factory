@@ -1,32 +1,167 @@
-"""Configuration loading for table-factory."""
+"""Strict version 2 configuration loading for table-factory."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import re
+import string
+from collections.abc import Hashable
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
 import yaml
+from yaml.constructor import ConstructorError
+from yaml.nodes import MappingNode
 
 from table_factory.errors import ConfigurationError
+
+_SQL_NAMESPACE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
+_SAFE_TOKEN = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]*\Z")
+_SAFE_TEMPLATE_LITERAL = re.compile(r"[A-Za-z0-9_]*\Z")
+_SAFE_LOCATION = re.compile(r"[A-Za-z0-9:/?&=._%+{}-]+\Z")
+_NAME_PLACEHOLDERS = frozenset({"source_database", "source_table"})
+_LOCATION_PLACEHOLDERS = frozenset({"hive_database", "hive_table", "profile", "server"})
+_GREENPLUM_IDENTIFIER_BYTES = 63
+
+
+class _UniqueKeySafeLoader(yaml.SafeLoader):
+    """Safe YAML loader that rejects ambiguous duplicate mapping keys."""
+
+    def construct_mapping(
+        self,
+        node: MappingNode,
+        deep: bool = False,
+    ) -> dict[Any, Any]:
+        self.flatten_mapping(node)
+        mapping: dict[Any, Any] = {}
+        for key_node, value_node in node.value:
+            key = self.construct_object(key_node, deep=deep)
+            if not isinstance(key, Hashable):
+                raise ConstructorError(
+                    "while constructing a mapping",
+                    node.start_mark,
+                    "found unhashable key",
+                    key_node.start_mark,
+                )
+            if key in mapping:
+                raise ConstructorError(
+                    "while constructing a mapping",
+                    node.start_mark,
+                    "found duplicate mapping key",
+                    key_node.start_mark,
+                )
+            mapping[key] = self.construct_object(value_node, deep=deep)
+        return mapping
+
+
+@dataclass(frozen=True, slots=True)
+class OutputConfig:
+    include_source_comment: bool = True
+    filename_separator: str = "__"
+
+
+@dataclass(frozen=True, slots=True)
+class HiveStorageConfig:
+    format: str = "textfile"
+    field_delimiter: str = ","
+    escape_character: str = "\\"
+    null_value: str = "\\N"
+
+
+@dataclass(frozen=True, slots=True)
+class HiveConfig:
+    target_database: str = "target_hive_db"
+    physical_table_name_template: str = "{source_table}_physical"
+    insert_mode: str = "into"
+    storage: HiveStorageConfig = field(default_factory=HiveStorageConfig)
+
+
+@dataclass(frozen=True, slots=True)
+class GreenplumDistributionConfig:
+    mode: str = "random"
+
+
+@dataclass(frozen=True, slots=True)
+class GreenplumExternalFormatConfig:
+    kind: str = "custom"
+    formatter: str = "pxfwritable_import"
+
+
+@dataclass(frozen=True, slots=True)
+class GreenplumExternalConfig:
+    location_template: str = "pxf://{hive_database}.{hive_table}?PROFILE={profile}&SERVER={server}"
+    profile: str = "Hive"
+    server: str = "default"
+    format: GreenplumExternalFormatConfig = field(default_factory=GreenplumExternalFormatConfig)
+
+
+@dataclass(frozen=True, slots=True)
+class GreenplumConfig:
+    database: str = "target_gp_database"
+    external_schema: str = "ext"
+    physical_schema: str = "dwh"
+    external_table_name_template: str = "{source_table}_ext"
+    physical_table_name_template: str = "{source_table}"
+    distribution: GreenplumDistributionConfig = field(default_factory=GreenplumDistributionConfig)
+    external: GreenplumExternalConfig = field(default_factory=GreenplumExternalConfig)
 
 
 @dataclass(frozen=True, slots=True)
 class FactoryConfig:
-    """Validated settings that influence deterministic rendering."""
+    """Validated settings for the source-to-target SQL workflow."""
 
-    dialect: str = "hive"
-    include_source_comment: bool = True
-    filename_separator: str = "__"
+    version: int = 2
+    output: OutputConfig = field(default_factory=OutputConfig)
+    hive: HiveConfig = field(default_factory=HiveConfig)
+    greenplum: GreenplumConfig = field(default_factory=GreenplumConfig)
+
+    @property
+    def include_source_comment(self) -> bool:
+        """Compatibility convenience for artifact headers."""
+        return self.output.include_source_comment
+
+    @property
+    def filename_separator(self) -> str:
+        """Compatibility convenience for artifact filenames."""
+        return self.output.filename_separator
 
     def as_dict(self) -> dict[str, object]:
-        """Return the effective configuration without filesystem details."""
+        """Return the complete effective configuration without filesystem details."""
         return {
-            "version": 1,
-            "dialect": self.dialect,
+            "version": self.version,
             "output": {
-                "include_source_comment": self.include_source_comment,
-                "filename_separator": self.filename_separator,
+                "include_source_comment": self.output.include_source_comment,
+                "filename_separator": self.output.filename_separator,
+            },
+            "hive": {
+                "target_database": self.hive.target_database,
+                "physical_table_name_template": (self.hive.physical_table_name_template),
+                "insert_mode": self.hive.insert_mode,
+                "storage": {
+                    "format": self.hive.storage.format,
+                    "field_delimiter": self.hive.storage.field_delimiter,
+                    "escape_character": self.hive.storage.escape_character,
+                    "null_value": self.hive.storage.null_value,
+                },
+            },
+            "greenplum": {
+                "database": self.greenplum.database,
+                "external_schema": self.greenplum.external_schema,
+                "physical_schema": self.greenplum.physical_schema,
+                "external_table_name_template": (self.greenplum.external_table_name_template),
+                "physical_table_name_template": (self.greenplum.physical_table_name_template),
+                "distribution": {
+                    "mode": self.greenplum.distribution.mode,
+                },
+                "external": {
+                    "location_template": (self.greenplum.external.location_template),
+                    "profile": self.greenplum.external.profile,
+                    "server": self.greenplum.external.server,
+                    "format": {
+                        "kind": self.greenplum.external.format.kind,
+                        "formatter": self.greenplum.external.format.formatter,
+                    },
+                },
             },
         }
 
@@ -34,15 +169,322 @@ class FactoryConfig:
 def _mapping(value: object, label: str) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise ConfigurationError(f"{label} must be a YAML mapping")
+    if any(not isinstance(key, str) for key in value):
+        raise ConfigurationError(f"{label} keys must be strings")
     return value
 
 
-def load_config(path: Path, *, display_name: str) -> FactoryConfig:
-    """Read and validate a YAML configuration file.
+def _keys(
+    value: dict[str, Any],
+    *,
+    label: str,
+    allowed: frozenset[str],
+    required: frozenset[str] | None = None,
+) -> None:
+    unknown = sorted(set(value) - allowed)
+    if unknown:
+        raise ConfigurationError(f"{label} contains unknown key: {unknown[0]}")
+    missing = sorted((required or allowed) - set(value))
+    if missing:
+        raise ConfigurationError(f"{label} is missing required key: {missing[0]}")
 
-    ``display_name`` is supplied by the CLI so an expected error never leaks an
-    absolute host path into a report.
-    """
+
+def _string_value(value: object, label: str) -> str:
+    if not isinstance(value, str):
+        raise ConfigurationError(f"{label} must be a string")
+    if not value:
+        raise ConfigurationError(f"{label} must not be empty")
+    if any(ord(character) < 32 or ord(character) == 127 for character in value):
+        raise ConfigurationError(f"{label} must not contain control characters")
+    return value
+
+
+def _namespace(
+    value: object,
+    label: str,
+    *,
+    max_utf8_bytes: int | None = None,
+) -> str:
+    result = _string_value(value, label)
+    if _SQL_NAMESPACE.fullmatch(result) is None:
+        raise ConfigurationError(
+            f"{label} must be one unqualified SQL identifier using letters, digits and underscores"
+        )
+    if max_utf8_bytes is not None and len(result.encode("utf-8")) > max_utf8_bytes:
+        raise ConfigurationError(f"{label} must contain at most {max_utf8_bytes} UTF-8 bytes")
+    return result
+
+
+def _template_fields(
+    value: str,
+    *,
+    label: str,
+    allowed: frozenset[str],
+    literal_pattern: re.Pattern[str],
+) -> tuple[str, ...]:
+    fields: list[str] = []
+    try:
+        parsed = tuple(string.Formatter().parse(value))
+    except ValueError as error:
+        raise ConfigurationError(f"{label} is malformed: {error}") from None
+    for literal, field_name, format_spec, conversion in parsed:
+        if literal_pattern.fullmatch(literal) is None:
+            raise ConfigurationError(f"{label} contains unsafe literal characters")
+        if field_name is None:
+            continue
+        if field_name not in allowed:
+            raise ConfigurationError(f"{label} contains unknown placeholder: {field_name}")
+        if format_spec or conversion:
+            raise ConfigurationError(f"{label} placeholders cannot use conversion or formatting")
+        fields.append(field_name)
+    return tuple(fields)
+
+
+def _name_template(value: object, label: str) -> str:
+    result = _string_value(value, label)
+    _template_fields(
+        result,
+        label=label,
+        allowed=_NAME_PLACEHOLDERS,
+        literal_pattern=_SAFE_TEMPLATE_LITERAL,
+    )
+    if not result.replace("{source_database}", "db").replace("{source_table}", "table"):
+        raise ConfigurationError(f"{label} must produce a non-empty table name")
+    return result
+
+
+def _one_character(value: object, label: str) -> str:
+    result = _string_value(value, label)
+    if len(result) != 1:
+        raise ConfigurationError(f"{label} must contain exactly one character")
+    return result
+
+
+def _storage_character(value: object, label: str) -> str:
+    result = _one_character(value, label)
+    if not result.isascii() or not result.isprintable():
+        raise ConfigurationError(f"{label} must be one printable ASCII character")
+    if result.isdigit():
+        raise ConfigurationError(
+            f"{label} must not be a digit because Hive interprets numeric delimiters as byte codes"
+        )
+    return result
+
+
+def _load_output(raw_value: object) -> OutputConfig:
+    raw = _mapping(raw_value, "output")
+    allowed = frozenset({"include_source_comment", "filename_separator"})
+    _keys(raw, label="output", allowed=allowed)
+    include_source_comment = raw["include_source_comment"]
+    if not isinstance(include_source_comment, bool):
+        raise ConfigurationError("output.include_source_comment must be a boolean")
+    separator = _string_value(raw["filename_separator"], "output.filename_separator")
+    if len(separator) > 8 or any(character not in "._-" for character in separator):
+        raise ConfigurationError(
+            "output.filename_separator may contain 1-8 '.', '_' or '-' characters"
+        )
+    return OutputConfig(
+        include_source_comment=include_source_comment,
+        filename_separator=separator,
+    )
+
+
+def _load_storage(raw_value: object) -> HiveStorageConfig:
+    raw = _mapping(raw_value, "hive.storage")
+    allowed = frozenset({"format", "field_delimiter", "escape_character", "null_value"})
+    _keys(raw, label="hive.storage", allowed=allowed)
+    storage_format = _string_value(raw["format"], "hive.storage.format").lower()
+    if storage_format != "textfile":
+        raise ConfigurationError(
+            "hive.storage.format must be 'textfile'; other formats are not supported end-to-end"
+        )
+    field_delimiter = _storage_character(
+        raw["field_delimiter"],
+        "hive.storage.field_delimiter",
+    )
+    escape_character = _storage_character(
+        raw["escape_character"],
+        "hive.storage.escape_character",
+    )
+    if field_delimiter == escape_character:
+        raise ConfigurationError("hive.storage.field_delimiter and escape_character must differ")
+    null_value = _string_value(raw["null_value"], "hive.storage.null_value")
+    if len(null_value) > 32:
+        raise ConfigurationError("hive.storage.null_value must contain at most 32 characters")
+    if not null_value.isascii() or not null_value.isprintable():
+        raise ConfigurationError("hive.storage.null_value must contain printable ASCII only")
+    if field_delimiter in null_value:
+        raise ConfigurationError(
+            "hive.storage.null_value must not contain hive.storage.field_delimiter"
+        )
+    if escape_character not in null_value:
+        raise ConfigurationError(
+            "hive.storage.null_value must contain hive.storage.escape_character "
+            "so the same non-null text remains distinguishable"
+        )
+    if null_value.endswith(escape_character):
+        raise ConfigurationError(
+            "hive.storage.null_value must not end with hive.storage.escape_character"
+        )
+    return HiveStorageConfig(
+        format=storage_format,
+        field_delimiter=field_delimiter,
+        escape_character=escape_character,
+        null_value=null_value,
+    )
+
+
+def _load_hive(raw_value: object) -> HiveConfig:
+    raw = _mapping(raw_value, "hive")
+    allowed = frozenset(
+        {
+            "target_database",
+            "physical_table_name_template",
+            "insert_mode",
+            "storage",
+        }
+    )
+    _keys(raw, label="hive", allowed=allowed)
+    insert_mode = _string_value(raw["insert_mode"], "hive.insert_mode").lower()
+    if insert_mode not in {"into", "overwrite"}:
+        raise ConfigurationError("hive.insert_mode must be 'into' or 'overwrite'")
+    return HiveConfig(
+        target_database=_namespace(raw["target_database"], "hive.target_database"),
+        physical_table_name_template=_name_template(
+            raw["physical_table_name_template"],
+            "hive.physical_table_name_template",
+        ),
+        insert_mode=insert_mode,
+        storage=_load_storage(raw["storage"]),
+    )
+
+
+def _load_distribution(raw_value: object) -> GreenplumDistributionConfig:
+    raw = _mapping(raw_value, "greenplum.distribution")
+    _keys(raw, label="greenplum.distribution", allowed=frozenset({"mode"}))
+    mode = _string_value(raw["mode"], "greenplum.distribution.mode").lower()
+    if mode != "random":
+        raise ConfigurationError("greenplum.distribution.mode must be 'random'")
+    return GreenplumDistributionConfig(mode=mode)
+
+
+def _load_external_format(raw_value: object) -> GreenplumExternalFormatConfig:
+    raw = _mapping(raw_value, "greenplum.external.format")
+    allowed = frozenset({"kind", "formatter"})
+    _keys(raw, label="greenplum.external.format", allowed=allowed)
+    kind = _string_value(raw["kind"], "greenplum.external.format.kind").lower()
+    formatter = _string_value(raw["formatter"], "greenplum.external.format.formatter").lower()
+    if kind != "custom" or formatter != "pxfwritable_import":
+        raise ConfigurationError(
+            "greenplum.external.format must use kind 'custom' with formatter "
+            "'pxfwritable_import' for textfile/Hive compatibility"
+        )
+    return GreenplumExternalFormatConfig(kind=kind, formatter=formatter)
+
+
+def _location_template(value: object) -> str:
+    label = "greenplum.external.location_template"
+    result = _string_value(value, label)
+    if _SAFE_LOCATION.fullmatch(result) is None:
+        raise ConfigurationError(f"{label} contains unsafe URI characters")
+    fields = _template_fields(
+        result,
+        label=label,
+        allowed=_LOCATION_PLACEHOLDERS,
+        literal_pattern=_SAFE_LOCATION,
+    )
+    missing = sorted(_LOCATION_PLACEHOLDERS - set(fields))
+    if missing:
+        raise ConfigurationError(f"{label} is missing required placeholder: {missing[0]}")
+    if not result.lower().startswith("pxf://"):
+        raise ConfigurationError(f"{label} must start with 'pxf://'")
+    resource, separator, query = result.partition("?")
+    expected_resource = "pxf://{hive_database}.{hive_table}"
+    expected_parameters = {
+        "PROFILE={profile}",
+        "SERVER={server}",
+    }
+    parameters = query.split("&") if separator else []
+    if (
+        resource != expected_resource
+        or len(parameters) != len(expected_parameters)
+        or set(parameters) != expected_parameters
+    ):
+        raise ConfigurationError(
+            f"{label} must use {expected_resource!r} and only "
+            "PROFILE={profile} and SERVER={server} query parameters"
+        )
+    return result
+
+
+def _load_external(raw_value: object) -> GreenplumExternalConfig:
+    raw = _mapping(raw_value, "greenplum.external")
+    allowed = frozenset({"location_template", "profile", "server", "format"})
+    _keys(raw, label="greenplum.external", allowed=allowed)
+    requested_profile = _string_value(raw["profile"], "greenplum.external.profile")
+    server = _string_value(raw["server"], "greenplum.external.server")
+    if _SAFE_TOKEN.fullmatch(requested_profile) is None:
+        raise ConfigurationError("greenplum.external.profile contains unsafe characters")
+    if requested_profile.casefold() != "hive":
+        raise ConfigurationError(
+            "greenplum.external.profile must be 'Hive' for the supported textfile/Hive workflow"
+        )
+    profile = "Hive"
+    if _SAFE_TOKEN.fullmatch(server) is None:
+        raise ConfigurationError("greenplum.external.server contains unsafe characters")
+    return GreenplumExternalConfig(
+        location_template=_location_template(raw["location_template"]),
+        profile=profile,
+        server=server,
+        format=_load_external_format(raw["format"]),
+    )
+
+
+def _load_greenplum(raw_value: object) -> GreenplumConfig:
+    raw = _mapping(raw_value, "greenplum")
+    allowed = frozenset(
+        {
+            "database",
+            "external_schema",
+            "physical_schema",
+            "external_table_name_template",
+            "physical_table_name_template",
+            "distribution",
+            "external",
+        }
+    )
+    _keys(raw, label="greenplum", allowed=allowed)
+    return GreenplumConfig(
+        database=_namespace(
+            raw["database"],
+            "greenplum.database",
+            max_utf8_bytes=_GREENPLUM_IDENTIFIER_BYTES,
+        ),
+        external_schema=_namespace(
+            raw["external_schema"],
+            "greenplum.external_schema",
+            max_utf8_bytes=_GREENPLUM_IDENTIFIER_BYTES,
+        ),
+        physical_schema=_namespace(
+            raw["physical_schema"],
+            "greenplum.physical_schema",
+            max_utf8_bytes=_GREENPLUM_IDENTIFIER_BYTES,
+        ),
+        external_table_name_template=_name_template(
+            raw["external_table_name_template"],
+            "greenplum.external_table_name_template",
+        ),
+        physical_table_name_template=_name_template(
+            raw["physical_table_name_template"],
+            "greenplum.physical_table_name_template",
+        ),
+        distribution=_load_distribution(raw["distribution"]),
+        external=_load_external(raw["external"]),
+    )
+
+
+def load_config(path: Path, *, display_name: str) -> FactoryConfig:
+    """Read and strictly validate a version 2 YAML configuration file."""
     if not path.is_file():
         raise ConfigurationError(f"configuration file does not exist: {display_name}")
 
@@ -57,7 +499,7 @@ def load_config(path: Path, *, display_name: str) -> FactoryConfig:
         ) from None
 
     try:
-        raw_value = yaml.safe_load(contents)
+        raw_value = yaml.load(contents, Loader=_UniqueKeySafeLoader)
     except yaml.YAMLError as error:
         problem = getattr(error, "problem", None) or "invalid YAML"
         mark = getattr(error, "problem_mark", None)
@@ -68,29 +510,24 @@ def load_config(path: Path, *, display_name: str) -> FactoryConfig:
 
     raw = _mapping(raw_value, "configuration")
     version = raw.get("version")
-    if type(version) is not int or version != 1:
-        raise ConfigurationError("configuration version must be 1")
-
-    dialect = raw.get("dialect", "hive")
-    if dialect != "hive":
-        raise ConfigurationError("only the 'hive' dialect is supported")
-
-    output_value = raw.get("output", {})
-    output = _mapping(output_value, "output")
-    include_source_comment = output.get("include_source_comment", True)
-    separator = output.get("filename_separator", "__")
-
-    if not isinstance(include_source_comment, bool):
-        raise ConfigurationError("output.include_source_comment must be a boolean")
-    if not isinstance(separator, str) or not separator or len(separator) > 8:
+    if type(version) is int and version == 1:
         raise ConfigurationError(
-            "output.filename_separator must be a non-empty string of at most 8 characters"
+            "configuration version 1 is no longer supported; migrate to version 2"
         )
-    if any(character not in "._-" for character in separator):
-        raise ConfigurationError("output.filename_separator may contain only '.', '_' and '-'")
+    allowed = frozenset({"version", "output", "hive", "greenplum"})
+    _keys(
+        raw,
+        label="configuration",
+        allowed=allowed,
+        required=frozenset({"version"}),
+    )
+    version = raw["version"]
+    if type(version) is not int or version != 2:
+        raise ConfigurationError("configuration version must be 2")
+    _keys(raw, label="configuration", allowed=allowed)
 
     return FactoryConfig(
-        dialect=dialect,
-        include_source_comment=include_source_comment,
-        filename_separator=separator,
+        output=_load_output(raw["output"]),
+        hive=_load_hive(raw["hive"]),
+        greenplum=_load_greenplum(raw["greenplum"]),
     )

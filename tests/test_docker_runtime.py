@@ -156,6 +156,7 @@ def test_documented_quality_commands_run_inside_the_container() -> None:
     commands = (
         ("pytest", "-q"),
         ("ruff", "check", "."),
+        ("ruff", "format", "--check", "."),
         ("mypy", "src"),
     )
     for entrypoint, *arguments in commands:
@@ -187,7 +188,13 @@ def test_compose_cli_generates_five_persistent_host_owned_files(
 
     generated = _output_bytes(mounted_case["editable_output"])
     assert result.returncode == 0
-    assert len(generated) == 5
+    assert list(generated) == [
+        "analytics_customer_orders__01_hive_create_physical.sql",
+        "analytics_customer_orders__02_hive_insert.sql",
+        "analytics_customer_orders__03_greenplum_create_external.sql",
+        "analytics_customer_orders__04_greenplum_create_physical.sql",
+        "analytics_customer_orders__05_greenplum_insert.sql",
+    ]
     assert all(generated.values())
     if sys.platform.startswith("linux") and hasattr(os, "getuid"):
         assert {path.stat().st_uid for path in mounted_case["editable_output"].glob("*.sql")} == {

@@ -1,81 +1,543 @@
 # table-factory
 
-`table-factory` — CLI-утилита для проверки Hive `CREATE TABLE` и генерации
-детерминированного набора служебных SQL-файлов.
+`table-factory` — офлайн CLI-утилита, которая преобразует DDL существующей
+Hive-таблицы в пять SQL-скриптов для переноса данных через новую физическую
+Hive-таблицу в новую физическую Greenplum-таблицу.
 
-Для каждой найденной таблицы создаются пять операций:
+Утилита работает только с локальными файлами: разбирает DDL, проверяет
+конфигурацию и генерирует SQL. Она не подключается к Hive, Hadoop, Greenplum
+или PXF, не выполняет SQL, не проверяет сеть и не хранит credentials. В
+`compose.yaml` есть только одноразовый сервис `table-factory`; целевые системы
+и другие внешние сервисы проект не запускает.
 
-| Артефакт | Назначение |
-| --- | --- |
-| `create` | исходный `CREATE TABLE` |
-| `drop` | безопасное удаление через `DROP TABLE IF EXISTS` |
-| `describe` | просмотр структуры через `DESCRIBE` |
-| `show-create` | получение DDL через `SHOW CREATE TABLE` |
-| `analyze` | сбор статистики через `ANALYZE TABLE ... COMPUTE STATISTICS` |
+## Рабочий процесс
 
-Проект является обычным устанавливаемым Python-пакетом. Docker используется
-только как воспроизводимая среда разработки: CLI внутри development-контейнера
-и CLI из wheel вызывают одну реализацию `table_factory.cli:main`.
+Практический сценарий начинается в Hue:
 
-## Возможности
+1. Откройте существующую Hive-таблицу в Hue и получите результат
+   `SHOW CREATE TABLE`.
+2. Сохраните результат как UTF-8 SQL-файл в `work/input/`, например
+   `work/input/customer_orders.sql`.
+3. Запустите `table-factory generate`.
+4. Получите пять готовых скриптов в `work/output/`.
+5. Передайте скрипты исполнителю целевой среды и выполните их по порядку.
 
-- запуск разработки без локальной установки Python;
-- обработка одного `.sql`-файла или рекурсивное чтение директории;
-- несколько `CREATE TABLE` в одном входном документе;
-- поддержка пробелов и Unicode в путях и именах файлов;
-- детерминированные и переносимые имена артефактов;
-- проверка коллизий до начала записи;
-- атомарная замена каждого выходного файла;
-- сохранение результатов на хосте через bind mount;
-- одинаковое поведение Docker- и wheel-вариантов;
-- отсутствие подключений к Hive, Hadoop или базам данных.
+```text
+Hue: SHOW CREATE TABLE
+          │
+          ▼
+work/input/*.sql
+          │
+          ▼
+table-factory generate  (локальный parse/validate/render, без подключений)
+          │
+          ▼
+work/output/*.sql
+```
 
-## Требования
+Сгенерированная цепочка данных:
 
-Для Docker-first разработки нужны только:
+```text
+существующая source Hive table
+          │  Hive INSERT
+          ▼
+новая физическая Hive table (TEXTFILE, без partitioning)
+          │  читается через PXF LOCATION строгого Hive-профиля
+          ▼
+Greenplum external table
+          │  Greenplum INSERT
+          ▼
+новая физическая Greenplum table
+```
 
-- Docker;
-- Docker Compose v2 с командой `docker compose`.
+Source-таблица считается существующим read-only источником. Ни один артефакт
+не изменяет и не удаляет её.
 
-Локальный Python для сборки, запуска CLI и проверок не требуется.
+## Быстрый старт
 
-Для установки готового wheel без Docker нужен Python 3.12 или новее.
-
-## Быстрый старт через Docker
-
-Скопируйте безопасный пример DDL в локальную входную директорию:
+Для Docker-first запуска нужны Docker и Docker Compose v2:
 
 ```bash
+export LOCAL_UID="$(id -u)"
+export LOCAL_GID="$(id -g)"
+
 cp examples/example.sql work/input/example.sql
-```
 
-Соберите development-образ:
+docker compose build table-factory
 
-```bash
-docker compose build
-```
-
-Запустите генерацию:
-
-```bash
 docker compose run --rm table-factory generate \
   --input ./work/input \
   --output ./work/output \
   --config ./config/table-factory.yaml
 ```
 
-После успешного запуска в `work/output` появятся:
+Корень проекта примонтирован в контейнер как `/workspace`, поэтому результат
+остаётся на хосте после завершения одноразового контейнера. Экспорт
+`LOCAL_UID`/`LOCAL_GID` нужен на Unix-хостах, чтобы build и последующие
+`docker compose run` использовали владельца bind-mounted файлов. Если
+переменные не заданы, Compose использует `1000:1000`.
+
+Первичная сборка может обращаться к registry базового image и Python package
+index, если нужных слоёв и пакетов ещё нет в cache. Уже собранный CLI выполняет
+`generate`, `validate` и `inspect` без сетевых обращений.
+
+Для source-таблицы `analytics.customer_orders` и стандартного разделителя `__`
+будут созданы:
 
 ```text
-analytics_customer_orders__create.sql
-analytics_customer_orders__drop.sql
-analytics_customer_orders__describe.sql
-analytics_customer_orders__show-create.sql
-analytics_customer_orders__analyze.sql
+analytics_customer_orders__01_hive_create_physical.sql
+analytics_customer_orders__02_hive_insert.sql
+analytics_customer_orders__03_greenplum_create_external.sql
+analytics_customer_orders__04_greenplum_create_physical.sql
+analytics_customer_orders__05_greenplum_insert.sql
 ```
 
-Контейнер одноразовый, но файлы остаются на хосте, потому что корень проекта
-примонтирован в `/workspace`.
+Существующая output-директория автоматически не очищается. Все новые файлы
+сначала полностью записываются во временные файлы, после чего совпадающие
+destinations заменяются последовательно. При обычной ошибке записи утилита
+пытается откатить уже выполненные замены. Это не единая файловая транзакция:
+аварийное завершение процесса и отказ самой операции rollback не гарантируют
+восстановление всего набора. Посторонние и устаревшие файлы остаются на месте.
+Используйте новую пустую директорию, если нужно проверить, что для одной
+таблицы результат содержит ровно эти пять файлов.
+
+## Что принимается на вход
+
+Поддерживаются обычные и external Hive-таблицы:
+
+```sql
+CREATE TABLE `analytics`.`customer_orders` (
+  `order_id` BIGINT COMMENT 'Stable order identifier',
+  `customer_name` STRING COMMENT 'Customer''s display name',
+  `ordered_at` TIMESTAMP,
+  `amount` DECIMAL(18,2)
+)
+COMMENT 'Заказы из Hue'
+PARTITIONED BY (
+  `business_date` DATE COMMENT 'Дата партиции источника'
+)
+STORED AS PARQUET
+LOCATION 'hdfs://example.invalid/warehouse/analytics/customer_orders'
+TBLPROPERTIES (
+  'source'='SHOW CREATE TABLE example'
+)
+```
+
+Завершающая точка с запятой необязательна. Ключевое слово `EXTERNAL` также
+необязательно: и `CREATE TABLE`, и `CREATE EXTERNAL TABLE` описывают уже
+существующий источник.
+
+Парсер поддерживает:
+
+- многострочный DDL и несколько таблиц в одном SQL-файле;
+- обычные и квалифицированные имена `database.table`;
+- backtick identifiers, включая экранированные обратные кавычки;
+- `TEMPORARY`, `EXTERNAL` и `IF NOT EXISTS`;
+- column и table `COMMENT`;
+- `PARTITIONED BY`;
+- распространённые column/table constraints;
+- `CLUSTERED BY` с необязательным `SORTED BY`, `SKEWED BY` с необязательным
+  `STORED AS DIRECTORIES` и другие перечисленные ниже table clauses в
+  стандартном Hive-порядке;
+- source `ROW FORMAT`, `STORED AS`, `STORED AS INPUTFORMAT ... OUTPUTFORMAT`,
+  `STORED BY`, `LOCATION`, `SERDEPROPERTIES` и `TBLPROPERTIES`;
+- source storage `TEXTFILE`, `SEQUENCEFILE`, `RCFILE`, `ORC`, `PARQUET`,
+  `AVRO` и `JSONFILE`;
+- разорванные на несколько значений Spark schema properties: они остаются
+  properties и не становятся колонками;
+- `-- ...` и `/* ... */` SQL-комментарии при разборе.
+
+Source storage и структурные clauses нужны только для корректного разбора. Они
+не определяют новую Hive-таблицу: source `TEMPORARY`, `IF NOT EXISTS`,
+`EXTERNAL`, constraints, `LOCATION`, SerDe, InputFormat, OutputFormat, storage
+format, `TBLPROPERTIES`, clustering, sorting, bucketing, skewing и
+`STORED AS DIRECTORIES` не переносятся в target. Признак `EXTERNAL` остаётся
+только в JSON команды `inspect`.
+
+Неквалифицированный source принимается; в Hive `INSERT` после `FROM`
+указывается только quoted name `` `table` ``, без команды `USE`. При
+исполнении такого файла необходимо заранее выбрать правильную текущую Hive
+database. Для однозначной цепочки предпочтительно передавать
+квалифицированный source `database.table`.
+
+Отклоняются:
+
+- `CREATE TABLE AS SELECT`;
+- `CREATE TABLE LIKE`;
+- SQL-команды и запросы, отличные от поддержанного `CREATE TABLE`;
+- malformed DDL, повторные или расположенные в неверном порядке table clauses;
+- пустой список колонок;
+- double-quoted identifiers и unquoted identifiers вне ASCII-грамматики
+  `[A-Za-z_][A-Za-z0-9_]*`; произвольные имена нужно заключать в backticks;
+- управляющие символы в source database/table/column identifiers и NUL в
+  table/column comments;
+- повторные column names среди общего списка обычных и partition columns после
+  Unicode NFKC normalization и сравнения без учёта регистра;
+- Hive column names с точкой (`.`) или двоеточием (`:`): такой DDL может
+  разбираться, но Hive не может надёжно адресовать эти колонки в сгенерированном
+  `SELECT`;
+- типы без безопасного Hive → Greenplum mapping.
+
+Input может быть одним `.sql`-файлом или директорией. Директория обходится
+рекурсивно и детерминированно, расширение `.sql` сравнивается без учёта
+регистра. Все документы читаются как UTF-8 и проверяются до начала записи.
+
+## Пять выходных файлов
+
+Файлы нужно выполнять в указанном порядке:
+
+| № | Роль и имя | Что делает |
+| --- | --- | --- |
+| 1 | `<stem>__01_hive_create_physical.sql` | Создаёт обычную непартиционированную Hive-таблицу в настроенной target database |
+| 2 | `<stem>__02_hive_insert.sql` | Явно переносит колонки из source Hive table в новую Hive table |
+| 3 | `<stem>__03_greenplum_create_external.sql` | Создаёт Greenplum external table, которая через PXF читает новую Hive table |
+| 4 | `<stem>__04_greenplum_create_physical.sql` | Создаёт обычную непартиционированную Greenplum table |
+| 5 | `<stem>__05_greenplum_insert.sql` | Явно переносит колонки из external table в physical table |
+
+Файлы 1–2 выполняются в Hive. Файлы 3–5 выполняются в Greenplum после
+подключения к `greenplum.database`. Утилита только генерирует SQL и не
+переключает execution context сама.
+
+Если `output.filename_separator` изменён, вместо `__` используется заданный
+разделитель; названия ролей и их порядок не меняются.
+
+Legacy-артефакты `create`, `drop`, `describe`, `show-create` и `analyze` больше
+не генерируются. Исходный `CREATE TABLE` также не копируется.
+
+Скрипты рассчитаны на новые, ещё не существующие targets и не являются
+идемпотентными: все три `CREATE` генерируются без `IF NOT EXISTS`. Если
+существующие targets сохранить и вручную повторить только DML, Hive
+`INSERT INTO` и Greenplum `INSERT INTO` допишут строки. Hive
+`INSERT OVERWRITE` заменит данные только в Hive target; Greenplum INSERT всё
+равно останется append-операцией.
+
+### 1. Hive physical table
+
+Первый файл содержит обычный `CREATE TABLE`, без `TEMPORARY`, `IF NOT EXISTS`,
+`EXTERNAL`, `LOCATION`, source storage, Spark properties, constraints,
+clustering, sorting, bucketing, skewing и partitioning. Target database и имя
+таблицы вычисляются из version 2 config. Namespace считается существующим и не
+создаётся.
+
+Колонки сохраняют source-порядок и Hive-типы, включая параметры
+`DECIMAL(p,s)`, `CHAR(n)` и `VARCHAR(n)`. Storage новой таблицы задаётся только
+`hive.storage`.
+
+### 2. Hive INSERT
+
+Второй файл использует:
+
+- `INSERT INTO TABLE` при `hive.insert_mode: into`;
+- `INSERT OVERWRITE TABLE` при `hive.insert_mode: overwrite`.
+
+При `into` target и source columns перечисляются явно и в одинаковом порядке.
+При `overwrite` грамматика Hive не допускает target column list, поэтому
+целевая колонка определяется позицией в детерминированном порядке колонок
+сгенерированного `CREATE TABLE`; `SELECT` по-прежнему перечисляет все source
+columns явно и в том же порядке. `SELECT *` не используется ни в одном режиме.
+
+### 3. Greenplum external table
+
+Третий файл создаёт `CREATE EXTERNAL TABLE` с явным mapped column list.
+`LOCATION` строится из `greenplum.external.location_template` и всегда
+подставляет имя новой физической Hive-таблицы, а не source-таблицы. Шаблон
+имеет фиксированную форму ресурса
+`pxf://{hive_database}.{hive_table}` и ровно два query-параметра:
+`PROFILE={profile}` и `SERVER={server}` (в любом порядке).
+
+Для стандартной конфигурации и `customer_orders` получится:
+
+```text
+pxf://target_hive_db.customer_orders_physical?PROFILE=Hive&SERVER=default
+```
+
+Location template хранится в config, но его структура фиксирована validator:
+менять можно PXF server и порядок двух query-параметров, а database/table
+подставляются из вычисленного Hive target. Другие resource paths, query
+parameters и profiles текущая schema не принимает. End-to-end-контракт
+разрешает только Hive profile и:
+
+```sql
+FORMAT 'CUSTOM' (
+  FORMATTER = 'pxfwritable_import'
+)
+```
+
+Это согласовано с чтением настроенной Hive `TEXTFILE`-таблицы через PXF Hive
+profile. Другие сочетания storage/profile/external format отклоняются, чтобы
+не создавать правдоподобный, но неподдержанный SQL.
+
+### 4. Greenplum physical table
+
+Четвёртый файл создаёт обычную `CREATE TABLE` в target schema. Текущая
+детерминированная distribution policy — `DISTRIBUTED RANDOMLY`. Database,
+schema и дополнительные структуры не создаются.
+
+### 5. Greenplum INSERT
+
+Пятый файл использует `INSERT INTO ... SELECT ... FROM ...` и явно перечисляет
+одинаковый ordered column list с обеих сторон. `SELECT *`, `DROP`, `TRUNCATE`
+и `ANALYZE` не добавляются.
+
+## Partition columns и comments
+
+Source-модель разделяет:
+
+1. обычные колонки из основного column list;
+2. колонки из `PARTITIONED BY`.
+
+В обоих физических target эти списки flatten-ятся в один:
+
+```text
+ordinary columns в исходном порядке
+→ бывшие partition columns в исходном порядке
+```
+
+Бывшие partition columns становятся обычными физическими колонками. Они
+присутствуют в обоих `CREATE`, Hive `INSERT`, Greenplum external table и
+Greenplum `INSERT`; `PARTITIONED BY` в target отсутствует. Все имена в общем
+списке обычных и partition columns должны быть уникальны после Unicode NFKC
+normalization и сравнения без учёта регистра; коллизия отклоняется до записи.
+
+Семантические comments переносятся так:
+
+- column comments, включая comments бывших partition columns, остаются inline
+  в Hive column definitions;
+- table comment остаётся Hive `COMMENT` clause;
+- Greenplum external и physical artifacts добавляют `COMMENT ON TABLE` и
+  `COMMENT ON COLUMN` после соответствующего `CREATE`.
+
+Апострофы, Unicode и identifiers экранируются отдельно для каждого диалекта:
+Hive использует backticks, Greenplum — double quotes. Произвольные исходные
+SQL-комментарии `-- ...` и `/* ... */` не переносятся.
+
+## Hive → Greenplum type mapping
+
+Mapping явный, регистронезависимый и fail-closed:
+
+| Hive type | Greenplum type |
+| --- | --- |
+| `STRING` | `TEXT` |
+| `VARCHAR(n)` | `VARCHAR(n)` |
+| `CHAR(n)` | `CHAR(n)` |
+| `TINYINT` | `SMALLINT` |
+| `SMALLINT` | `SMALLINT` |
+| `INT` | `INTEGER` |
+| `INTEGER` | `INTEGER` |
+| `BIGINT` | `BIGINT` |
+| `FLOAT` | `REAL` |
+| `REAL` | `REAL` |
+| `DOUBLE` | `DOUBLE PRECISION` |
+| `DOUBLE PRECISION` | `DOUBLE PRECISION` |
+| `DECIMAL` / `NUMERIC` | `NUMERIC(10,0)` (Hive default precision/scale) |
+| `DECIMAL(p)` / `NUMERIC(p)` | `NUMERIC(p,0)` |
+| `DECIMAL(p,s)` / `NUMERIC(p,s)` | `NUMERIC(p,s)` |
+| `BOOLEAN` | `BOOLEAN` |
+| `DATE` | `DATE` |
+| `TIMESTAMP` | `TIMESTAMP` |
+
+Hive `DECIMAL`/`NUMERIC` precision ограничен диапазоном `1..38`, scale не
+может превышать precision. `CHAR` допускает длину `1..255`, `VARCHAR` —
+`1..65535`.
+
+Не поддерживаются и не преобразуются молча в `TEXT`:
+
+- `ARRAY`, `MAP`, `STRUCT`, `UNIONTYPE`;
+- `VOID`;
+- `BINARY`;
+- `TIMESTAMPLOCALTZ`, `TIMESTAMP_LTZ`,
+  `TIMESTAMP WITH LOCAL TIME ZONE`;
+- `INTERVAL_DAY_TIME`, `INTERVAL_YEAR_MONTH`;
+- неизвестные custom types;
+- любой другой тип, отсутствующий в таблице mapping.
+
+Ошибка содержит source table, column name, исходный Hive type и причину.
+Mapping всех таблиц проверяется до записи, поэтому такая ошибка не оставляет
+частичный набор SQL-файлов.
+
+## TEXTFILE — не RFC CSV
+
+Единственный поддержанный end-to-end target storage сейчас:
+
+```sql
+ROW FORMAT DELIMITED
+  FIELDS TERMINATED BY ...
+  ESCAPED BY ...
+  NULL DEFINED AS ...
+STORED AS TEXTFILE
+```
+
+Это delimiter-based Hive TEXTFILE, а не полноценный RFC CSV. Он не гарантирует
+RFC-совместимую обработку quoted delimiters, quoted переносов строк и всех
+остальных CSV edge cases. Delimiter и escape должны быть разными печатными
+ASCII-символами, но не цифрами. Null marker должен быть печатной ASCII-строкой
+длиной `1..32`, содержать escape-символ, не заканчиваться им и не содержать
+delimiter. Это консервативный контракт validator, предназначенный для
+различения SQL `NULL` и совпадающего non-null текста. Утилита не выполняет
+сериализацию и не проверяет это допущение на конкретных версиях Hive/PXF,
+поэтому выбирайте значения с учётом данных и проверяйте их в целевой среде.
+ORC, Parquet и другие target formats отклоняются, пока они не поддержаны
+согласованно всей цепочкой до Greenplum.
+
+Source при этом может быть Parquet или использовать SerDe/InputFormat:
+source storage разбирается, но не копируется.
+
+## Version 2 config
+
+Путь к YAML-конфигурации обязателен для `generate`, `validate` и `inspect`.
+Автоматического поиска config нет. Все показанные ниже поля обязательны;
+неизвестные, отсутствующие и повторяющиеся mapping keys на любом уровне
+отклоняются.
+
+Актуальный [`config/table-factory.yaml`](config/table-factory.yaml):
+
+```yaml
+version: 2
+
+output:
+  include_source_comment: true
+  filename_separator: "__"
+
+hive:
+  target_database: target_hive_db
+  physical_table_name_template: "{source_table}_physical"
+  insert_mode: into
+  storage:
+    format: textfile
+    field_delimiter: ","
+    escape_character: "\\"
+    null_value: "\\N"
+
+greenplum:
+  database: target_gp_database
+  external_schema: ext
+  physical_schema: dwh
+  external_table_name_template: "{source_table}_ext"
+  physical_table_name_template: "{source_table}"
+  distribution:
+    mode: random
+  external:
+    location_template: "pxf://{hive_database}.{hive_table}?PROFILE={profile}&SERVER={server}"
+    profile: Hive
+    server: default
+    format:
+      kind: custom
+      formatter: pxfwritable_import
+```
+
+Version 1 несовместима с новым workflow и не получает неявных defaults:
+загрузка завершается сообщением о миграции на version 2.
+
+### Поля config
+
+| Поле | Тип и допустимые значения | Назначение |
+| --- | --- | --- |
+| `version` | integer, только `2` | Версия несовместимой v2 schema |
+| `output.include_source_comment` | boolean | Добавлять безопасный header с basename source-файла |
+| `output.filename_separator` | string из `.`/`_`/`-`, длина `1..8` | Разделять portable stem и стабильную роль файла |
+| `hive.target_database` | непустой unqualified identifier | Database новой физической Hive table |
+| `hive.physical_table_name_template` | безопасный name template | Имя новой Hive table |
+| `hive.insert_mode` | `into` или `overwrite` | Режим Hive INSERT |
+| `hive.storage.format` | только `textfile` | End-to-end storage новой Hive table |
+| `hive.storage.field_delimiter` | один printable non-digit ASCII character | `FIELDS TERMINATED BY` |
+| `hive.storage.escape_character` | один printable non-digit ASCII character, отличный от delimiter | `ESCAPED BY` |
+| `hive.storage.null_value` | printable ASCII string длиной `1..32`, содержащая escape, но не в конце, и без delimiter | `NULL DEFINED AS` |
+| `greenplum.database` | непустой unqualified identifier, не более 63 UTF-8 bytes | Database execution/connection context |
+| `greenplum.external_schema` | непустой unqualified identifier, не более 63 UTF-8 bytes | Schema external table |
+| `greenplum.physical_schema` | непустой unqualified identifier, не более 63 UTF-8 bytes | Schema physical table |
+| `greenplum.external_table_name_template` | безопасный name template | Имя external table |
+| `greenplum.physical_table_name_template` | безопасный name template | Имя physical table |
+| `greenplum.distribution.mode` | только `random` | `DISTRIBUTED RANDOMLY` |
+| `greenplum.external.location_template` | безопасный `pxf://...` template | PXF LOCATION новой Hive table |
+| `greenplum.external.profile` | только `Hive`; регистр input не учитывается, effective value нормализуется в `Hive` | PXF profile поддержанного workflow |
+| `greenplum.external.server` | ASCII token `[A-Za-z0-9_][A-Za-z0-9_.-]*` | Имя PXF server целевой среды |
+| `greenplum.external.format.kind` | только `custom` | Greenplum external format |
+| `greenplum.external.format.formatter` | только `pxfwritable_import` | PXF custom formatter |
+
+Database и schema должны быть одиночными identifiers из ASCII letters, digits
+и underscore, начинаться с letter или underscore и не содержать точки.
+Greenplum database, schema, вычисленные table names и column names не могут
+превышать 63 bytes в UTF-8.
+
+Значения `hive.storage.format`, `hive.insert_mode`,
+`greenplum.distribution.mode`, `greenplum.external.format.kind` и
+`greenplum.external.format.formatter` принимаются без учёта регистра и
+нормализуются в lowercase. Profile нормализуется отдельно в каноническое
+значение `Hive`.
+
+Name templates разрешают literal-фрагменты только из ASCII
+`[A-Za-z0-9_]*` и placeholders:
+
+- `{source_database}`;
+- `{source_table}`.
+
+Неизвестные placeholders, format specs, conversions и другие literal
+characters отклоняются. Например, literal hyphen в
+`{source_table}-physical` недопустим. Unicode и hyphen могут попасть в
+результат только из значения source placeholder. Результат шаблона может
+содержать только Unicode letters/digits, underscore и hyphen, в том числе
+начинаться с цифры: target identifier всегда корректно quoted. Backticks
+расширяют синтаксис source identifier, но не допустимый алфавит target: если
+подставленное source-значение содержит другие символы, semantic preflight
+отклонит результат. Поддерживаются, например, source identifiers
+`` `orders-2026` `` и `` `2026_orders` ``. Если source не квалифицирован
+database, шаблон с `{source_database}` использовать нельзя. Вычисленные
+Greenplum table names дополнительно ограничены 63 UTF-8 bytes.
+
+`greenplum.external.location_template`:
+
+- должен иметь ресурс ровно
+  `pxf://{hive_database}.{hive_table}`;
+- обязан содержать только два query-параметра:
+  `PROFILE={profile}` и `SERVER={server}`; допускается любой их порядок;
+- не допускает credentials, дополнительных query-параметров, других
+  placeholders, format specs или произвольных SQL fragments.
+
+В config нет полей credentials. Не помещайте secrets в URI или name
+templates.
+
+## Правила target naming
+
+При стандартном config source `analytics.customer_orders` превращается в:
+
+| Объект | Вычисленное имя |
+| --- | --- |
+| Hive physical | `` `target_hive_db`.`customer_orders_physical` `` |
+| Greenplum external | `"ext"."customer_orders_ext"` |
+| Greenplum physical | `"dwh"."customer_orders"` |
+| Greenplum execution database | `target_gp_database` |
+
+Каждый Hive target сравнивается со всеми source tables текущей партии, а не
+только со своим source. Поэтому target одной таблицы не может совпасть с
+source другой таблицы, включая совпадения после Unicode normalization и без
+учёта регистра. Для source без database совпадение по table name отклоняется
+консервативно, поскольку execution database неизвестна.
+Greenplum external и physical table не могут иметь одинаковые table name в
+одной schema. Коллизии targets и output filenames между несколькими source
+tables сравниваются с Unicode normalization и без учёта регистра до записи.
+
+Filename stem строится из source qualified name, а не target name. Точка и
+небезопасные символы заменяются `_`, Unicode нормализуется, повторные `_`
+схлопываются, а stem обрезается до 160 UTF-8 bytes. Поэтому
+`analytics.customer_orders` получает stem `analytics_customer_orders`.
+
+## Greenplum database и schema
+
+`greenplum.database` — database, к которой исполнитель должен подключиться
+перед запуском Greenplum-скриптов. Это execution context, а не часть имени
+таблицы.
+
+Сгенерированный SQL использует корректные двухчастные имена:
+
+```sql
+"ext"."customer_orders_ext"
+"dwh"."customer_orders"
+```
+
+Он не генерирует неподдержанное
+`"database"."schema"."table"`. Schema является частью qualified table name,
+database — нет. Утилита не создаёт database или schema: все target namespaces
+должны существовать заранее.
 
 ## CLI
 
@@ -85,16 +547,7 @@ analytics_customer_orders__analyze.sql
 docker compose run --rm table-factory --help
 ```
 
-Доступны три команды:
-
-```text
-generate    проверить DDL и создать SQL-артефакты
-validate    проверить DDL без записи файлов
-inspect     вывести разобранную модель одного файла в JSON
-```
-
-Все относительные пути вычисляются от текущей рабочей директории. Для
-предсказуемого поведения рекомендуется передавать пути в форме `./path`.
+Все относительные CLI paths вычисляются от текущей рабочей директории.
 
 ### `generate`
 
@@ -105,29 +558,9 @@ docker compose run --rm table-factory generate \
   --config ./config/table-factory.yaml
 ```
 
-Параметры:
-
-| Параметр | Описание |
-| --- | --- |
-| `--input` | один `.sql`-файл или директория с DDL |
-| `--output` | директория для сгенерированных SQL-файлов |
-| `--config` | YAML-конфигурация |
-
-Директория `--input` обходится рекурсивно. Учитываются файлы с расширением
-`.sql` без учёта регистра. Перед записью утилита:
-
-1. находит все входные SQL-файлы;
-2. читает их как UTF-8;
-3. разбирает все `CREATE TABLE`;
-4. проверяет коллизии нормализованных имён;
-5. создаёт по пять файлов на таблицу.
-
-При двух таблицах будет создано десять файлов, при трёх — пятнадцать и так
-далее.
-
-Файлы с совпадающими именами заменяются атомарно. Остальные файлы в output
-автоматически не удаляются, поэтому директорию можно использовать для
-накопления результатов нескольких независимых запусков.
+Команда выполняет полный parse, semantic validation, type mapping, render и
+collision validation, а затем пишет артефакты. При успехе сообщает число
+созданных SQL-файлов: пять на таблицу.
 
 ### `validate`
 
@@ -137,12 +570,9 @@ docker compose run --rm table-factory validate \
   --config ./config/table-factory.yaml
 ```
 
-Команда использует те же правила поиска и разбора, что и `generate`, но ничего
-не записывает. При успехе выводится количество проверенных таблиц и файлов:
-
-```text
-Validated 1 table(s) in 1 file(s).
-```
+Команда выполняет ту же подготовку без записи. Проверяются все input DDL,
+comments, partition columns, target names, config compatibility, Hive storage,
+PXF settings, type mapping и collisions.
 
 ### `inspect`
 
@@ -152,212 +582,73 @@ docker compose run --rm table-factory inspect \
   --config ./config/table-factory.yaml
 ```
 
-`inspect` принимает ровно один SQL-файл и выводит JSON с:
+`inspect` принимает один SQL-файл и выводит UTF-8 JSON, содержащий:
 
-- безопасным относительным именем источника;
-- эффективной конфигурацией;
-- именем базы и таблицы;
-- квалифицированным именем;
-- списком колонок и типов.
+- безопасный source path label без абсолютного host path;
+- полную effective version 2 config;
+- source database, table, qualified name и `external` flag;
+- отдельные ordinary и partition columns, Hive types и comments;
+- table comment;
+- вычисленные Hive, Greenplum external и Greenplum physical targets;
+- Greenplum execution database;
+- mapped Greenplum types и признак бывшей partition column.
 
-JSON выводится в UTF-8 без экранирования Unicode.
+Все три команды возвращают `0` при успехе. Ожидаемые ошибки конфигурации, DDL,
+mapping и файловых операций возвращают `2`, печатаются в `stderr` без
+traceback и не раскрывают абсолютные host paths.
 
-### Коды завершения
+## Безопасность файлов и детерминизм
 
-| Код | Значение |
-| --- | --- |
-| `0` | команда выполнена успешно |
-| `2` | ошибка аргументов, конфигурации, DDL или файловой операции |
+- Пользовательские symlink input, вложенные symlink directories/files и
+  symlink-компоненты input path отклоняются; то же правило действует для
+  output directory и её родительских компонентов. Стабильные root-owned
+  системные aliases вроде macOS `/var` и `/tmp` разрешены.
+- Сгенерированное имя является только filename и не может выйти из output
+  через path traversal.
+- Ни один destination не может быть тем же файлом, что и прочитанный input
+  DDL. Проверяется как совпадение пути, так и filesystem identity через
+  `samefile`, поэтому hard-link alias входного файла также не перезаписывается.
+- Защита `samefile` относится к прочитанным DDL, но не к YAML config или
+  посторонним файлам. Любой существующий non-directory destination с именем
+  генерируемого артефакта считается заменяемым. Не храните config и другие
+  важные файлы в output под такими именами.
+- `--output` не исключается из рекурсивного поиска directory `--input`.
+  Output не должен совпадать с input directory или находиться внутри неё:
+  следующий запуск воспримет сгенерированные `.sql` как новые входные
+  документы. Для одиночного input-файла это ограничение не требуется.
+- Все input-файлы разбираются, target/type mapping и collisions проверяются до
+  записи.
+- Полный набор артефактов сначала записывается во временные файлы, затем
+  destinations заменяются последовательными атомарными `os.replace`. Набор в
+  целом не атомарен для параллельного читателя и не является crash-safe.
+- При ошибке записи выполняется best-effort rollback, включая попытку
+  восстановить существовавшие файлы. Если filesystem отказывает и при
+  rollback или cleanup, CLI возвращает контролируемую ошибку без traceback, а
+  временный или recovery backup может остаться для ручного восстановления.
+- SQL headers содержат только безопасный basename источника.
+- Повторная генерация при неизменном наборе реально прочитанных input-файлов и
+  том же config побайтово детерминирована.
+- Файлы, не входящие в текущий набор артефактов, не удаляются.
 
-Ожидаемые ошибки выводятся в `stderr` без traceback и абсолютных путей хоста.
+При двух таблицах создаётся десять артефактов, при трёх — пятнадцать.
+Несколько таблиц могут находиться в одном файле или в разных файлах
+рекурсивного input tree.
 
-## Поддерживаемый Hive DDL
+## Проверки проекта
 
-Парсер намеренно принимает проверяемое подмножество Hive DDL: `CREATE TABLE` с
-явным непустым списком колонок.
-
-Поддерживаются:
-
-- `TEMPORARY`, `EXTERNAL` и `IF NOT EXISTS`;
-- обычные и квалифицированные имена `database.table`;
-- идентификаторы в обратных кавычках, включая экранированные двойные обратные
-  кавычки;
-- простые типы Hive;
-- `DECIMAL`, `NUMERIC`, `CHAR` и `VARCHAR`;
-- вложенные `ARRAY`, `MAP`, `STRUCT` и `UNIONTYPE`;
-- column comments и распространённые column/table constraints;
-- table clauses в официальном порядке:
-  `COMMENT`, `PARTITIONED BY`, `CLUSTERED BY`, `SKEWED BY`, `ROW FORMAT`,
-  `STORED`, `LOCATION`, `TBLPROPERTIES`.
-
-Поддерживаемые built-in storage formats: `TEXTFILE`, `SEQUENCEFILE`, `RCFILE`,
-`ORC`, `PARQUET`, `AVRO` и `JSONFILE`. Также распознаются формы
-`STORED AS INPUTFORMAT ... OUTPUTFORMAT ...` и `STORED BY ...`.
-
-Ограничения параметризованных типов:
-
-- `DECIMAL`/`NUMERIC`: precision от `1` до `38`, scale не больше precision;
-- `CHAR`: длина от `1` до `255`;
-- `VARCHAR`: длина от `1` до `65535`;
-- ключ `MAP` должен иметь примитивный Hive-тип.
-
-Каждый table clause может встречаться только один раз. Неправильный порядок,
-дубликаты и неподдерживаемые фрагменты приводят к ошибке валидации.
-
-Не поддерживаются:
-
-- `CREATE TABLE AS SELECT`;
-- `CREATE TABLE LIKE`;
-- DDL-команды кроме `CREATE TABLE`;
-- произвольные Hive-запросы и выполнение SQL.
-
-CTAS и `LIKE` отклоняются явно: без полноценного Hive query parser утилита не
-может достоверно подтвердить их корректность.
-
-## Выходные файлы
-
-По умолчанию имя строится из квалифицированного имени таблицы, разделителя из
-конфигурации и типа операции:
-
-```text
-<database>_<table><separator><operation>.sql
-```
-
-Для `analytics.customer_orders` и разделителя `__`:
-
-```text
-analytics_customer_orders__create.sql
-analytics_customer_orders__drop.sql
-analytics_customer_orders__describe.sql
-analytics_customer_orders__show-create.sql
-analytics_customer_orders__analyze.sql
-```
-
-Небезопасные символы заменяются, Unicode нормализуется, а длина имени
-ограничивается с учётом UTF-8. Если разные таблицы после нормализации получают
-одинаковое имя, генерация завершается ошибкой до создания файлов.
-
-При включённом `include_source_comment` каждый файл начинается с комментария:
-
-```sql
--- Generated by table-factory from example.sql
-```
-
-`create.sql` сохраняет исходный `CREATE TABLE`, включая поддерживаемые comments,
-constraints и table clauses. Остальные четыре файла используют безопасно
-закавыченное квалифицированное имя таблицы.
-
-## Конфигурация
-
-Конфигурация по умолчанию находится в
-[`config/table-factory.yaml`](config/table-factory.yaml):
-
-```yaml
-version: 1
-dialect: hive
-
-output:
-  include_source_comment: true
-  filename_separator: "__"
-```
-
-Параметр `--config` обязателен для `generate`, `validate` и `inspect`.
-Автоматического поиска конфигурации нет: путь всегда передаётся явно.
-
-Поля:
-
-| Поле | Тип | Значение |
-| --- | --- | --- |
-| `version` | integer | версия схемы; сейчас только `1` |
-| `dialect` | string | SQL-диалект; сейчас только `hive` |
-| `output.include_source_comment` | boolean | добавлять комментарий с источником |
-| `output.filename_separator` | string | разделитель имени и операции |
-
-`filename_separator` должен:
-
-- быть непустой строкой;
-- содержать не более восьми символов;
-- состоять только из `.`, `_` и `-`.
-
-Пример без комментария и с разделителем `-`:
-
-```yaml
-version: 1
-dialect: hive
-
-output:
-  include_source_comment: false
-  filename_separator: "-"
-```
-
-## Работа с путями и файлами
-
-Утилита придерживается следующих правил:
-
-- относительные пути разрешаются от текущей рабочей директории;
-- входные документы читаются только как UTF-8;
-- symlink для входного файла, входной директории или вложенной SQL-цели
-  отклоняется;
-- symlink в качестве output-директории отклоняется;
-- генерируемое имя всегда является обычным именем файла без вложенного пути;
-- абсолютные пути хоста не попадают в stdout, stderr, JSON и SQL-комментарии;
-- управляющие символы в отображаемых путях экранируются;
-- временные файлы удаляются при ошибке записи.
-
-`work/input/*` и `work/output/*` исключены из Git. Пустые директории сохраняются
-через `.gitkeep`.
-
-## Docker-first разработка
-
-Development-образ содержит:
-
-- Python 3.12;
-- пакет `table-factory` в editable-режиме;
-- pytest;
-- Ruff;
-- mypy;
-- Python build.
-
-Корень проекта монтируется как `/workspace`. Изменения в `src/`, `tests/`,
-`config/` и `examples/` доступны следующему контейнеру без пересборки.
-
-Образ необходимо пересобрать после изменения:
-
-- `pyproject.toml`;
-- зависимостей;
-- `Dockerfile`.
+Все основные проверки запускаются из корня репозитория без target Hive,
+Greenplum или PXF. На Unix используйте `LOCAL_UID`/`LOCAL_GID`, экспортированные
+в разделе быстрого старта:
 
 ```bash
-docker compose build
+docker compose config --quiet
 ```
-
-### Права файлов на Linux
-
-По умолчанию Compose использует UID/GID `1000:1000`. Если идентификаторы
-текущего пользователя отличаются, перед сборкой задайте:
-
-```bash
-export LOCAL_UID="$(id -u)"
-export LOCAL_GID="$(id -g)"
-docker compose build
-```
-
-Эти значения используются и при `docker compose run`, поэтому файлы в
-bind-mounted директориях создаются от имени хост-пользователя, а не `root`.
-
-## Проверки качества
-
-Все основные проверки запускаются без локального Python.
-
-Тесты:
 
 ```bash
 docker compose run --rm \
   --entrypoint pytest \
-  table-factory
+  table-factory -q
 ```
-
-Lint:
 
 ```bash
 docker compose run --rm \
@@ -365,23 +656,11 @@ docker compose run --rm \
   table-factory check .
 ```
 
-Проверка форматирования:
-
 ```bash
 docker compose run --rm \
   --entrypoint ruff \
   table-factory format --check .
 ```
-
-Форматирование:
-
-```bash
-docker compose run --rm \
-  --entrypoint ruff \
-  table-factory format .
-```
-
-Строгая проверка типов:
 
 ```bash
 docker compose run --rm \
@@ -389,15 +668,23 @@ docker compose run --rm \
   table-factory src
 ```
 
-### Opt-in Docker acceptance
+Сборка wheel и sdist:
 
-Обычная команда `pytest` внутри development-контейнера запускает unit- и
-contract-тесты. Тесты, которые сами собирают образ и управляют
-`docker compose`, пропускаются, чтобы не запускать Docker рекурсивно из
-контейнера.
+```bash
+docker compose run --rm \
+  --entrypoint python \
+  table-factory -m build
+```
 
-Полный acceptance-набор запускается с хоста и является необязательным. Для него
-нужен локальный Python 3.12 с dev-зависимостями:
+После изменения `pyproject.toml`, зависимостей или `Dockerfile` сначала
+пересоберите development image:
+
+```bash
+docker compose build table-factory
+```
+
+Docker acceptance tests, которые сами управляют Docker, запускаются с хоста
+после установки dev dependencies:
 
 ```bash
 python3.12 -m venv .venv
@@ -406,132 +693,80 @@ python -m pip install -e ".[dev]"
 TABLE_FACTORY_RUN_DOCKER_TESTS=1 pytest -q tests/test_docker_runtime.py
 ```
 
-Acceptance-набор проверяет сборку образа, non-root пользователя, editable
-install, persistent output, `generate`/`validate`/`inspect`, сборку wheel,
-чистую установку wheel и совпадение результата с Docker CLI.
+## Установка и запуск без Docker
 
-## Сборка wheel и sdist
-
-Соберите пакет внутри контейнера:
+Для установки wheel нужен Python 3.12 или новее:
 
 ```bash
-docker compose run --rm \
-  --entrypoint python \
-  table-factory -m build
+VERSION=0.1.0
+python -m pip install "dist/table_factory-${VERSION}-py3-none-any.whl"
 ```
 
-Результат останется на хосте:
-
-```text
-dist/
-├── table_factory-<version>-py3-none-any.whl
-└── table_factory-<version>.tar.gz
-```
-
-`dist/` является воспроизводимым build output и исключён из Git.
-
-## Установка без Docker
-
-Установка готового wheel:
+Доступна та же реализация CLI:
 
 ```bash
-python -m pip install dist/table_factory-<version>-py3-none-any.whl
-```
+table-factory validate \
+  --input ./input \
+  --config ./table-factory.yaml
 
-После установки доступна та же команда:
-
-```bash
 table-factory generate \
   --input ./input \
   --output ./output \
   --config ./table-factory.yaml
 ```
 
-Runtime-зависимость `PyYAML` устанавливается через metadata wheel.
+Runtime-зависимость `PyYAML` устанавливается из metadata wheel. Ни Docker-, ни
+wheel-вариант CLI не подключается к target systems.
 
-Для локальной editable-разработки без Docker:
+## Ограничения
 
-```bash
-python3.12 -m venv .venv
-source .venv/bin/activate
-python -m pip install -e ".[dev]"
-```
+- SQL генерируется, но не выполняется и не проверяется на реальных кластерах.
+- Утилита не обращается к catalog и не знает, существуют ли target tables вне
+  текущей input-партии. До исполнения убедитесь, что вычисленные targets
+  свободны.
+- Target Hive storage ограничен `TEXTFILE`; external contract ограничен PXF
+  Hive profile с `CUSTOM/pxfwritable_import`.
+- Greenplum distribution policy ограничена `DISTRIBUTED RANDOMLY`.
+- Target Hive/Greenplum database и schemas должны существовать заранее.
+- Hive `INSERT INTO` использует target column list; `INSERT OVERWRITE`
+  использует детерминированный порядок target DDL и явный source `SELECT`,
+  поскольку target column list в этой форме грамматикой Hive не поддерживается.
+- В config настраивается PXF server и порядок двух query-параметров, но не
+  структура URI, profile, formatter или дополнительные параметры. Если
+  deployment требует другой контракт, текущую schema и renderer нужно
+  расширить; сгенерированный SQL необходимо проверить в целевой среде.
+- Утилита не проверяет содержимое строк на совместимость с выбранными
+  delimiter, escape и null marker.
+- Source modifiers, constraints, partitioning, storage, `LOCATION`, properties,
+  clustering, sorting, bucketing и skewing в target не переносятся; переносятся
+  только колонки, Hive-типы и семантические table/column comments.
+- Сгенерированные `CREATE` не имеют `IF NOT EXISTS`; Hive `INSERT INTO` и
+  Greenplum INSERT имеют append-семантику. Набор предназначен для
+  контролируемого однократного запуска на свободные target names.
+- При directory input output не должен совпадать с ним или быть его
+  поддиректорией; это ограничение пока не проверяется автоматически.
+- Непустая output-директория не очищается.
 
-Этот способ необязателен и не используется в Docker-first сценарии.
+## Структура реализации
 
-## Структура проекта
+Основной поток:
 
 ```text
-.
-├── Dockerfile
-├── compose.yaml
-├── pyproject.toml
-├── config/
-│   └── table-factory.yaml
-├── examples/
-│   └── example.sql
-├── src/
-│   └── table_factory/
-│       ├── cli.py
-│       ├── config.py
-│       ├── generator.py
-│       ├── models.py
-│       ├── parser.py
-│       └── workflow.py
-├── tests/
-├── work/
-│   ├── input/
-│   └── output/
-└── README.md
+CLI
+→ strict config validation
+→ recursive discovery/read all inputs
+→ Hive parse
+→ target naming и type mapping
+→ source/target collision validation
+→ Hive/Greenplum render
+→ output-name и destination/input collision validation
+→ staged replacement с best-effort rollback
 ```
 
-Основные модули:
-
-| Модуль | Ответственность |
-| --- | --- |
-| `cli.py` | аргументы, команды, коды завершения |
-| `config.py` | загрузка и проверка YAML |
-| `parser.py` | разбор поддерживаемого Hive DDL |
-| `models.py` | неизменяемые модели таблиц и колонок |
-| `generator.py` | имена, SQL-шаблоны и безопасная запись |
-| `workflow.py` | поиск входов и координация генерации |
-
-## Типовые ошибки
-
-### `no SQL files found in input`
-
-Проверьте, что:
-
-- путь существует;
-- внутри есть обычные файлы с расширением `.sql`;
-- SQL-файлы не являются symlink.
-
-### `multiple tables map to the same output name`
-
-Две таблицы после нормализации получили одинаковое имя файла. Переименуйте
-таблицу или запускайте наборы отдельно.
-
-### `output directory must not be a symbolic link`
-
-Передайте обычную директорию внутри проекта вместо symlink.
-
-### Файлы на Linux принадлежат UID `1000`
-
-Пересоберите образ со своими UID/GID:
-
-```bash
-export LOCAL_UID="$(id -u)"
-export LOCAL_GID="$(id -g)"
-docker compose build --no-cache
-```
-
-### Изменились зависимости, но контейнер использует старые версии
-
-Пересоберите development-образ:
-
-```bash
-docker compose build
-```
+Ответственность разделена между `config.py`, `parser.py`, `models.py`,
+`naming.py`, `type_mapper.py`, `hive_renderer.py`,
+`greenplum_renderer.py`, `sql.py`, `path_safety.py`, `generator.py` и
+`workflow.py`.
 
 ## Лицензия
 

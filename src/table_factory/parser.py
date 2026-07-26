@@ -13,7 +13,7 @@ _CREATE_TABLE = re.compile(
     rf"""
     \bCREATE\s+
     (?:TEMPORARY\s+)?
-    (?:EXTERNAL\s+)?
+    (?P<external>EXTERNAL\s+)?
     TABLE\s+
     (?:IF\s+NOT\s+EXISTS\s+)?
     (?P<name>{_IDENTIFIER}(?:\s*\.\s*{_IDENTIFIER})?)
@@ -216,7 +216,7 @@ def _top_level_parts(value: str, *, delimiter: str = ",") -> Iterator[str]:
     yield value[start:]
 
 
-def _strip_top_level_comment(type_and_comment: str) -> str:
+def _split_column_clauses(type_and_comment: str) -> tuple[str, str | None]:
     """Separate a Hive type from supported top-level column clauses."""
     round_depth = 0
     angle_depth = 0
@@ -255,10 +255,12 @@ def _strip_top_level_comment(type_and_comment: str) -> str:
             before = type_and_comment[index - 1] if index else " "
             if keyword in _COLUMN_CLAUSE_KEYWORDS and not (before.isalnum() or before == "_"):
                 clauses = type_and_comment[index:].strip()
-                _validate_column_clauses(clauses)
-                return type_and_comment[:index].strip()
+                return (
+                    type_and_comment[:index].strip(),
+                    _parse_column_clauses(clauses),
+                )
         index += 1
-    return type_and_comment.strip()
+    return type_and_comment.strip(), None
 
 
 def _quoted_literal_end(value: str, start: int = 0) -> int:
@@ -282,6 +284,63 @@ def _quoted_literal_end(value: str, start: int = 0) -> int:
             continue
         index += 1
     raise DdlParseError("unterminated quoted Hive string")
+
+
+def _quoted_literal(value: str, start: int = 0) -> tuple[str, int]:
+    """Decode one Hive quoted string and return its end offset."""
+    index = start
+    while index < len(value) and value[index].isspace():
+        index += 1
+    end = _quoted_literal_end(value, start)
+    quote = value[index]
+    cursor = index + 1
+    content_end = end - 1
+    decoded: list[str] = []
+    escapes = {
+        "0": "\0",
+        "b": "\b",
+        "n": "\n",
+        "r": "\r",
+        "t": "\t",
+        "Z": "\x1a",
+    }
+    while cursor < content_end:
+        character = value[cursor]
+        next_character = value[cursor + 1] if cursor + 1 < content_end else ""
+        if character == quote and next_character == quote:
+            decoded.append(quote)
+            cursor += 2
+            continue
+        if character == "\\" and next_character:
+            if next_character == "u" and cursor + 6 <= content_end:
+                hexadecimal = value[cursor + 2 : cursor + 6]
+                if re.fullmatch(r"[0-9A-Fa-f]{4}", hexadecimal) is None:
+                    raise DdlParseError("invalid Unicode escape in a Hive string")
+                decoded.append(chr(int(hexadecimal, 16)))
+                cursor += 6
+                continue
+            octal = value[cursor + 1 : cursor + 4]
+            if (
+                len(octal) == 3
+                and octal[0] in "01"
+                and all(digit in "01234567" for digit in octal[1:])
+            ):
+                decoded.append(chr(int(octal, 8)))
+                cursor += 4
+                continue
+            if next_character in {"%", "_"}:
+                decoded.append(f"\\{next_character}")
+            else:
+                decoded.append(escapes.get(next_character, next_character))
+            cursor += 2
+            continue
+        decoded.append(character)
+        cursor += 1
+    try:
+        result = "".join(decoded).encode("utf-16-le", errors="surrogatepass").decode("utf-16-le")
+    except UnicodeError:
+        raise DdlParseError("invalid Unicode surrogate escape in a Hive string") from None
+    return result, end
 
 
 def _balanced_expression_end(
@@ -348,13 +407,16 @@ def _validate_properties(value: str, *, label: str) -> None:
         raise DdlParseError(f"{label} must contain quoted key/value pairs")
 
 
-def _validate_column_clauses(value: str) -> None:
-    """Validate common Hive column comments and constraints."""
+def _parse_column_clauses(value: str) -> str | None:
+    """Validate column clauses and return their semantic Hive comment."""
     remaining = value.strip()
+    comment: str | None = None
     while remaining:
         upper = remaining.upper()
         if re.match(r"COMMENT\b", upper):
-            end = _quoted_literal_end(remaining, len("COMMENT"))
+            if comment is not None:
+                raise DdlParseError("duplicate column COMMENT clause")
+            comment, end = _quoted_literal(remaining, len("COMMENT"))
             remaining = remaining[end:].strip()
             continue
         match = re.match(
@@ -411,6 +473,7 @@ def _validate_column_clauses(value: str) -> None:
             remaining = remaining[match.end() :].strip()
             continue
         raise DdlParseError("unsupported or malformed column constraint")
+    return comment
 
 
 def _consume_keyword(value: str, pattern: str, *, label: str) -> int:
@@ -436,11 +499,13 @@ def _record_table_clause(
     return order
 
 
-def _validate_table_tail(value: str) -> None:
-    """Validate the supported Hive table-level clauses after the column list."""
+def _parse_table_tail(value: str) -> tuple[tuple[Column, ...], str | None]:
+    """Validate table clauses and return partition columns and table comment."""
     remaining = value.strip()
     seen: set[str] = set()
     previous_order = -1
+    partition_columns: tuple[Column, ...] = ()
+    table_comment: str | None = None
     while remaining:
         upper = remaining.upper()
         if re.match(r"COMMENT\b", upper):
@@ -449,7 +514,7 @@ def _validate_table_tail(value: str) -> None:
                 seen=seen,
                 previous_order=previous_order,
             )
-            end = _quoted_literal_end(remaining, len("COMMENT"))
+            table_comment, end = _quoted_literal(remaining, len("COMMENT"))
             remaining = remaining[end:].strip()
             continue
         if re.match(r"PARTITIONED\b", upper):
@@ -468,7 +533,7 @@ def _validate_table_tail(value: str) -> None:
                 start,
                 label="PARTITIONED BY",
             )
-            _columns(contents)
+            partition_columns = _columns(contents, allow_constraints=False)
             remaining = remaining[end:].strip()
             continue
         if re.match(r"CLUSTERED\b", upper):
@@ -676,6 +741,7 @@ def _validate_table_tail(value: str) -> None:
         if re.match(r"AS\b", upper):
             raise DdlParseError("CREATE TABLE AS SELECT is unsupported")
         raise DdlParseError("unsupported or malformed Hive table clause")
+    return partition_columns, table_comment
 
 
 def _validate_table_constraint(definition: str) -> None:
@@ -896,7 +962,10 @@ class _TypeParser:
                 self._optional_comment()
             self._expect(">")
             return False
-        raise DdlParseError(f"unsupported Hive data type: {name}")
+        # A syntactically simple custom type is preserved for the semantic
+        # type mapper, which can then report table/column/type context. Any
+        # trailing parameters or tokens are still rejected by ``parse``.
+        return True
 
     def _remaining_words(self, *words: str) -> bool:
         starting_index = self.index
@@ -916,7 +985,11 @@ def _validate_type(data_type: str) -> None:
     _TypeParser(data_type).parse()
 
 
-def _columns(column_list: str) -> tuple[Column, ...]:
+def _columns(
+    column_list: str,
+    *,
+    allow_constraints: bool = True,
+) -> tuple[Column, ...]:
     columns: list[Column] = []
     for raw_definition in _top_level_parts(column_list):
         definition = raw_definition.strip()
@@ -924,16 +997,24 @@ def _columns(column_list: str) -> tuple[Column, ...]:
             raise DdlParseError("empty column definition")
         first_word = definition.split(maxsplit=1)[0].upper()
         if first_word in _NON_COLUMN_PREFIXES:
+            if not allow_constraints:
+                raise DdlParseError("PARTITIONED BY must contain only column definitions")
             _validate_table_constraint(definition)
             continue
         match = _COLUMN.match(definition)
         if match is None:
             raise DdlParseError("cannot parse a column definition")
-        data_type = _strip_top_level_comment(match.group("type"))
+        data_type, comment = _split_column_clauses(match.group("type"))
         if not data_type:
             raise DdlParseError("a column is missing its data type")
         _validate_type(data_type)
-        columns.append(Column(name=_unquote(match.group("name")), data_type=data_type))
+        columns.append(
+            Column(
+                name=_unquote(match.group("name")),
+                data_type=data_type,
+                comment=comment,
+            )
+        )
     if not columns:
         raise DdlParseError("CREATE TABLE must define at least one column")
     return tuple(columns)
@@ -961,13 +1042,16 @@ def parse_hive_ddl(sql: str) -> tuple[Table, ...]:
             if cleaned[statement_end - 1 : statement_end] == ";"
             else statement_end
         )
-        _validate_table_tail(cleaned[closing + 1 : tail_end])
+        partition_columns, table_comment = _parse_table_tail(cleaned[closing + 1 : tail_end])
         database, name = _qualified_name(match.group("name"))
         tables.append(
             Table(
                 database=database,
                 name=name,
                 columns=_columns(cleaned[opening + 1 : closing]),
+                partition_columns=partition_columns,
+                external=match.group("external") is not None,
+                comment=table_comment,
                 create_sql=sql[match.start() : statement_end].strip(),
             )
         )

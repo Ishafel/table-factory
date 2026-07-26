@@ -6,6 +6,9 @@ from pathlib import Path
 import pytest
 from conftest import invoke_cli, parse_json_output
 
+from table_factory.errors import OutputSafetyError
+from table_factory.generator import Artifact, write_artifacts
+from table_factory.path_safety import has_untrusted_symlink_component
 from table_factory.workflow import display_path
 
 
@@ -48,6 +51,12 @@ def test_display_path_handles_a_symlink_loop_without_exposing_the_host(
     _assert_no_absolute_workspace_path(label, tmp_path)
 
 
+def test_root_owned_system_path_aliases_are_not_treated_as_user_symlinks() -> None:
+    aliases = [path for path in (Path("/var"), Path("/tmp")) if path.is_symlink()]
+    if aliases:
+        assert all(not has_untrusted_symlink_component(path / "folders") for path in aliases)
+
+
 def test_generate_resolves_relative_unicode_paths_and_writes_five_files(
     cli_case: dict[str, Path],
 ) -> None:
@@ -64,9 +73,21 @@ def test_generate_resolves_relative_unicode_paths_and_writes_five_files(
     )
 
     generated = _generated_sql(cli_case["output"])
-    assert len(generated) == 5
+    assert [path.name for path in generated] == [
+        "analytics_customer_orders__01_hive_create_physical.sql",
+        "analytics_customer_orders__02_hive_insert.sql",
+        "analytics_customer_orders__03_greenplum_create_external.sql",
+        "analytics_customer_orders__04_greenplum_create_physical.sql",
+        "analytics_customer_orders__05_greenplum_insert.sql",
+    ]
     assert all(path.stat().st_size > 0 for path in generated)
     assert not list(cli_case["output"].rglob("*.tmp"))
+    combined_sql = "\n".join(path.read_text(encoding="utf-8") for path in generated).upper()
+    assert "DROP " not in combined_sql
+    assert "DESCRIBE " not in combined_sql
+    assert "SHOW CREATE" not in combined_sql
+    assert "ANALYZE " not in combined_sql
+    assert "SELECT *" not in combined_sql
 
     observable_text = result.stdout + result.stderr
     observable_text += "".join(path.read_text(encoding="utf-8") for path in generated)
@@ -94,6 +115,112 @@ def test_generate_is_repeatable_and_does_not_accumulate_outputs(
 
     assert len(first) == 5
     assert second == first
+
+
+def test_generate_does_not_clean_unrelated_existing_outputs(
+    cli_case: dict[str, Path],
+) -> None:
+    root = cli_case["root"]
+    cli_case["output"].mkdir()
+    unrelated = cli_case["output"] / "keep-this.sql"
+    unrelated.write_text("-- user-owned file\n", encoding="utf-8")
+
+    invoke_cli(
+        "generate",
+        "--input",
+        _relative(cli_case["input"], root),
+        "--output",
+        _relative(cli_case["output"], root),
+        "--config",
+        _relative(cli_case["config"], root),
+        cwd=root,
+    )
+
+    assert unrelated.read_text(encoding="utf-8") == "-- user-owned file\n"
+    assert len(_generated_sql(cli_case["output"])) == 6
+
+
+def test_generate_rejects_an_artifact_path_that_is_the_input_ddl(
+    tmp_path: Path,
+    repository_config: Path,
+) -> None:
+    input_path = tmp_path / "db_t__01_hive_create_physical.sql"
+    original = b"CREATE TABLE db.t (id BIGINT);\n"
+    input_path.write_bytes(original)
+
+    result = invoke_cli(
+        "generate",
+        "--input",
+        input_path,
+        "--output",
+        tmp_path,
+        "--config",
+        repository_config,
+        cwd=tmp_path,
+        check=False,
+    )
+
+    assert result.returncode == 2
+    assert "refusing to overwrite an input SQL file" in result.stderr
+    assert input_path.read_bytes() == original
+    assert sorted(path.name for path in tmp_path.iterdir()) == [input_path.name]
+    assert "Traceback" not in result.stderr
+
+
+@pytest.mark.skipif(
+    not hasattr(os, "link"),
+    reason="The platform cannot create hard links",
+)
+def test_generate_rejects_a_destination_that_is_a_hard_link_to_input_ddl(
+    tmp_path: Path,
+    repository_config: Path,
+) -> None:
+    input_directory = tmp_path / "input"
+    output_directory = tmp_path / "output"
+    input_directory.mkdir()
+    output_directory.mkdir()
+    input_path = input_directory / "source.sql"
+    original = b"CREATE TABLE db.t (id BIGINT);\n"
+    input_path.write_bytes(original)
+
+    first_destination = output_directory / "db_t__01_hive_create_physical.sql"
+    first_destination.write_bytes(b"existing output must remain unchanged\n")
+    hard_link = output_directory / "db_t__05_greenplum_insert.sql"
+    try:
+        os.link(input_path, hard_link)
+    except OSError as error:
+        pytest.skip(f"Cannot create hard links in this environment: {error}")
+    assert os.path.samefile(input_path, hard_link)
+
+    before = {
+        path.name: path.read_bytes()
+        for path in sorted(output_directory.iterdir())
+        if path.is_file()
+    }
+    result = invoke_cli(
+        "generate",
+        "--input",
+        input_path,
+        "--output",
+        output_directory,
+        "--config",
+        repository_config,
+        cwd=tmp_path,
+        check=False,
+    )
+
+    assert result.returncode == 2
+    assert "refusing to overwrite an input SQL file" in result.stderr
+    assert input_path.read_bytes() == original
+    assert os.path.samefile(input_path, hard_link)
+    assert {
+        path.name: path.read_bytes()
+        for path in sorted(output_directory.iterdir())
+        if path.is_file()
+    } == before
+    assert not list(output_directory.glob("*.tmp"))
+    assert not list(output_directory.glob("*.bak"))
+    assert "Traceback" not in result.stderr
 
 
 def test_validate_accepts_the_example_without_creating_sql(
@@ -181,6 +308,107 @@ def test_validate_does_not_follow_a_sql_symlink_outside_the_input_directory(
     _assert_no_absolute_workspace_path(result.stdout + result.stderr, root)
 
 
+@pytest.mark.skipif(
+    not hasattr(os, "symlink"),
+    reason="The platform cannot create symlinks",
+)
+def test_validate_rejects_the_final_input_path_when_it_is_a_symlink(
+    cli_case: dict[str, Path],
+) -> None:
+    root = cli_case["root"]
+    link = root / "linked input"
+    try:
+        link.symlink_to(cli_case["input"], target_is_directory=True)
+    except OSError as error:
+        pytest.skip(f"Cannot create directory symlinks in this environment: {error}")
+
+    result = invoke_cli(
+        "validate",
+        "--input",
+        _relative(link, root),
+        "--config",
+        _relative(cli_case["config"], root),
+        cwd=root,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "input path must not be a symbolic link" in result.stderr
+    _assert_no_absolute_workspace_path(result.stdout + result.stderr, root)
+
+
+@pytest.mark.skipif(
+    not hasattr(os, "symlink"),
+    reason="The platform cannot create symlinks",
+)
+def test_validate_rejects_a_symlink_parent_component_of_the_input(
+    cli_case: dict[str, Path],
+    tmp_path: Path,
+) -> None:
+    root = cli_case["root"]
+    outside_parent = tmp_path / "outside parent"
+    outside_input = outside_parent / "real input"
+    outside_input.mkdir(parents=True)
+    (outside_input / "outside.sql").write_text(
+        "CREATE TABLE outside_table (id BIGINT);\n",
+        encoding="utf-8",
+    )
+    link = root / "linked parent"
+    try:
+        link.symlink_to(outside_parent, target_is_directory=True)
+    except OSError as error:
+        pytest.skip(f"Cannot create directory symlinks in this environment: {error}")
+
+    result = invoke_cli(
+        "validate",
+        "--input",
+        str(Path(link.name) / outside_input.name),
+        "--config",
+        _relative(cli_case["config"], root),
+        cwd=root,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "input path must not contain a symbolic-link component" in result.stderr
+    _assert_no_absolute_workspace_path(result.stdout + result.stderr, root)
+
+
+@pytest.mark.skipif(
+    not hasattr(os, "symlink"),
+    reason="The platform cannot create symlinks",
+)
+def test_validate_rejects_a_nested_input_directory_symlink(
+    cli_case: dict[str, Path],
+) -> None:
+    root = cli_case["root"]
+    outside = root / "outside input"
+    outside.mkdir()
+    (outside / "outside.sql").write_text(
+        "CREATE TABLE outside_table (id BIGINT);\n",
+        encoding="utf-8",
+    )
+    link = cli_case["input"] / "linked directory"
+    try:
+        link.symlink_to(outside, target_is_directory=True)
+    except OSError as error:
+        pytest.skip(f"Cannot create directory symlinks in this environment: {error}")
+
+    result = invoke_cli(
+        "validate",
+        "--input",
+        _relative(cli_case["input"], root),
+        "--config",
+        _relative(cli_case["config"], root),
+        cwd=root,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "input directory must not contain a symbolic link" in result.stderr
+    _assert_no_absolute_workspace_path(result.stdout + result.stderr, root)
+
+
 def test_cli_treats_a_tilde_path_as_relative_to_the_current_directory(
     cli_case: dict[str, Path],
 ) -> None:
@@ -215,7 +443,24 @@ def test_inspect_returns_json_and_keeps_host_paths_private(
 
     document = parse_json_output(result)
     assert isinstance(document, dict)
-    assert document
+    assert document["config"]["version"] == 2
+    table = document["tables"][0]
+    assert table["source_path"] == "входные DDL/пример таблицы.sql"
+    assert table["qualified_name"] == "analytics.customer_orders"
+    assert table["external"] is True
+    assert [column["name"] for column in table["partition_columns"]] == ["business_date"]
+    assert table["targets"]["hive"]["qualified_name"] == ("target_hive_db.customer_orders_physical")
+    assert table["targets"]["greenplum"]["external"]["qualified_name"] == (
+        "ext.customer_orders_ext"
+    )
+    assert table["targets"]["greenplum"]["physical"]["qualified_name"] == ("dwh.customer_orders")
+    assert [column["greenplum_type"] for column in table["greenplum_columns"]] == [
+        "BIGINT",
+        "TEXT",
+        "TIMESTAMP",
+        "NUMERIC(18,2)",
+        "DATE",
+    ]
     _assert_no_absolute_workspace_path(result.stdout + result.stderr, root)
 
 
@@ -296,7 +541,7 @@ def test_table_name_cannot_escape_the_output_directory(
     assert all(path.is_relative_to(output_root) for path in new_files)
 
 
-def test_create_artifact_preserves_table_level_hive_clauses(
+def test_hive_physical_artifact_replaces_source_storage_and_partitioning(
     cli_case: dict[str, Path],
 ) -> None:
     root = cli_case["root"]
@@ -311,8 +556,20 @@ def test_create_artifact_preserves_table_level_hive_clauses(
         cwd=root,
     )
 
-    create = next(cli_case["output"].glob("*__create.sql")).read_text(encoding="utf-8")
-    assert "STORED AS PARQUET" in create
+    create = next(cli_case["output"].glob("*__01_hive_create_physical.sql")).read_text(
+        encoding="utf-8"
+    )
+    assert "CREATE TABLE `target_hive_db`.`customer_orders_physical`" in create
+    assert "`business_date` DATE COMMENT 'Source partition date'" in create
+    assert "STORED AS TEXTFILE" in create
+    assert "FIELDS TERMINATED BY ','" in create
+    assert "ESCAPED BY '\\\\'" in create
+    assert "NULL DEFINED AS '\\\\N'" in create
+    assert "EXTERNAL" not in create
+    assert "PARTITIONED BY" not in create
+    assert "STORED AS PARQUET" not in create
+    assert "LOCATION" not in create
+    assert "TBLPROPERTIES" not in create
 
 
 @pytest.mark.skipif(
@@ -377,3 +634,115 @@ def test_output_directory_symlink_is_rejected(
 
     assert result.returncode != 0
     assert not list(outside.iterdir())
+
+
+@pytest.mark.skipif(
+    not hasattr(os, "symlink"),
+    reason="The platform cannot create symlinks",
+)
+def test_output_path_with_a_symlink_parent_component_is_rejected(
+    cli_case: dict[str, Path],
+    tmp_path: Path,
+) -> None:
+    root = cli_case["root"]
+    outside = tmp_path / "outside parent"
+    outside.mkdir()
+    link = root / "linked parent"
+    try:
+        link.symlink_to(outside, target_is_directory=True)
+    except OSError as error:
+        pytest.skip(f"Cannot create directory symlinks in this environment: {error}")
+
+    result = invoke_cli(
+        "generate",
+        "--input",
+        _relative(cli_case["input"], root),
+        "--output",
+        str(Path(link.name) / "nested output"),
+        "--config",
+        _relative(cli_case["config"], root),
+        cwd=root,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "output path must not contain a symbolic-link component" in result.stderr
+    assert not list(outside.iterdir())
+    _assert_no_absolute_workspace_path(result.stdout + result.stderr, root)
+
+
+def test_write_artifacts_restores_the_whole_set_when_second_commit_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output = tmp_path / "output"
+    output.mkdir()
+    first = output / "first.sql"
+    second = output / "second.sql"
+    first.write_text("old first\n", encoding="utf-8")
+    second.write_text("old second\n", encoding="utf-8")
+    artifacts = [
+        Artifact(filename=first.name, content="new first\n"),
+        Artifact(filename=second.name, content="new second\n"),
+    ]
+
+    real_replace = os.replace
+    staged_commits = 0
+
+    def fail_second_staged_commit(source: str | Path, destination: str | Path) -> None:
+        nonlocal staged_commits
+        if str(source).endswith(".tmp"):
+            staged_commits += 1
+            if staged_commits == 2:
+                raise OSError("simulated second commit failure")
+        real_replace(source, destination)
+
+    monkeypatch.setattr(os, "replace", fail_second_staged_commit)
+
+    with pytest.raises(OutputSafetyError, match=r"second\.sql"):
+        write_artifacts(output, artifacts)
+
+    assert first.read_text(encoding="utf-8") == "old first\n"
+    assert second.read_text(encoding="utf-8") == "old second\n"
+    assert sorted(path.name for path in output.iterdir()) == [
+        "first.sql",
+        "second.sql",
+    ]
+
+
+def test_write_artifacts_reports_backup_cleanup_failure_without_raw_io_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output = tmp_path / "output"
+    output.mkdir()
+    destination = output / "artifact.sql"
+    destination.write_text("old\n", encoding="utf-8")
+    artifact = Artifact(filename=destination.name, content="new\n")
+
+    real_unlink = Path.unlink
+    backup_unlinks = 0
+
+    def fail_committed_backup_cleanup(
+        path: Path,
+        missing_ok: bool = False,
+    ) -> None:
+        nonlocal backup_unlinks
+        if path.suffix == ".bak":
+            backup_unlinks += 1
+            if backup_unlinks == 2:
+                raise PermissionError(13, "Permission denied", str(path))
+        real_unlink(path, missing_ok=missing_ok)
+
+    monkeypatch.setattr(Path, "unlink", fail_committed_backup_cleanup)
+
+    with pytest.raises(
+        OutputSafetyError,
+        match=r"files were replaced.*transaction cleanup failed.*artifact\.sql",
+    ):
+        write_artifacts(output, [artifact])
+
+    assert destination.read_text(encoding="utf-8") == "new\n"
+    backups = list(output.glob("*.bak"))
+    assert len(backups) == 1
+    backups[0].unlink()
