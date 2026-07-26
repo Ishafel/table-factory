@@ -1,0 +1,6 @@
+version: 1
+dialect: hive
+
+output:
+  include_source_comment: true
+  filename_separator: "__"
