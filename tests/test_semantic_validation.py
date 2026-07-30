@@ -9,7 +9,7 @@ from conftest import invoke_cli
 @pytest.mark.parametrize("column_name", ("order.id", "order:id"))
 def test_hive_columns_that_cannot_be_queried_are_rejected_before_write(
     tmp_path: Path,
-    repository_config: Path,
+    test_config_path: Path,
     column_name: str,
 ) -> None:
     ddl = tmp_path / "invalid_column.sql"
@@ -26,7 +26,7 @@ def test_hive_columns_that_cannot_be_queried_are_rejected_before_write(
         "--output",
         output,
         "--config",
-        repository_config,
+        test_config_path,
         cwd=tmp_path,
         check=False,
     )
@@ -41,7 +41,7 @@ def test_hive_columns_that_cannot_be_queried_are_rejected_before_write(
 @pytest.mark.parametrize("column_name", ("partition.day", "partition:day"))
 def test_unqueryable_partition_column_names_are_also_rejected(
     tmp_path: Path,
-    repository_config: Path,
+    test_config_path: Path,
     column_name: str,
 ) -> None:
     ddl = tmp_path / "invalid_partition_column.sql"
@@ -55,7 +55,7 @@ def test_unqueryable_partition_column_names_are_also_rejected(
         "--input",
         ddl,
         "--config",
-        repository_config,
+        test_config_path,
         cwd=tmp_path,
         check=False,
     )

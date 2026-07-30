@@ -11,9 +11,15 @@ from typing import Any
 import yaml
 from conftest import PROJECT_ROOT
 
+from table_factory.config import load_config
+
+RUNTIME_CONFIG_PATH = PROJECT_ROOT / "config" / "table-factory.yaml"
+
 REQUIRED_FILES = (
     "Dockerfile",
     "compose.yaml",
+    "config/table-factory.yaml",
+    "tests/fixtures/table-factory.yaml",
     ".dockerignore",
     ".gitignore",
     "pyproject.toml",
@@ -46,6 +52,15 @@ def _entrypoint_tokens(entrypoint: Any) -> list[str]:
 def test_required_project_files_exist() -> None:
     missing = [name for name in REQUIRED_FILES if not (PROJECT_ROOT / name).is_file()]
     assert not missing, f"Missing required project files: {missing}"
+
+
+def test_runtime_config_is_valid_and_uses_current_version() -> None:
+    runtime_config = load_config(
+        RUNTIME_CONFIG_PATH,
+        display_name="config/table-factory.yaml",
+    )
+
+    assert runtime_config.version == 3
 
 
 def test_compose_defines_one_transient_bind_mounted_service() -> None:

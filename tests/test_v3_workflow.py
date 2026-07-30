@@ -1,3 +1,5 @@
+"""End-to-end workflow tests for the strict version 3 configuration."""
+
 from __future__ import annotations
 
 import re
@@ -49,7 +51,7 @@ def _generate(
     ddl: Path,
     output_directory: Path,
     *,
-    repository_config: Path,
+    test_config_path: Path,
     cwd: Path,
 ) -> dict[str, str]:
     invoke_cli(
@@ -59,7 +61,7 @@ def _generate(
         "--output",
         output_directory,
         "--config",
-        repository_config,
+        test_config_path,
         cwd=cwd,
     )
     return _read_artifacts(output_directory)
@@ -70,11 +72,11 @@ def _normalized_type(data_type: str) -> str:
 
 
 def _modified_config(
-    repository_config: Path,
+    test_config_path: Path,
     destination: Path,
     *replacements: tuple[str, str],
 ) -> Path:
-    contents = repository_config.read_text(encoding="utf-8")
+    contents = test_config_path.read_text(encoding="utf-8")
     for old, new in replacements:
         assert old in contents
         contents = contents.replace(old, new, 1)
@@ -136,13 +138,13 @@ def test_large_show_create_fixture_preserves_all_111_columns() -> None:
 
 def test_large_fixture_generates_exact_five_role_chain_deterministically(
     tmp_path: Path,
-    repository_config: Path,
+    test_config_path: Path,
 ) -> None:
     output_directory = tmp_path / "generated"
     generated = _generate(
         LARGE_DDL,
         output_directory,
-        repository_config=repository_config,
+        test_config_path=test_config_path,
         cwd=tmp_path,
     )
     expected_names = _artifact_names("sample_source_large_table")
@@ -166,7 +168,7 @@ def test_large_fixture_generates_exact_five_role_chain_deterministically(
 
     hive_create = generated[expected_names[0]]
     assert (
-        f"CREATE TABLE `target_hive_db`.`large_table_physical` (\n{hive_definitions}\n)"
+        f"CREATE TABLE `target_hive_db`.`replica_large_table_physical` (\n{hive_definitions}\n)"
     ) in hive_create
     assert "ROW FORMAT DELIMITED" in hive_create
     assert "FIELDS TERMINATED BY ','" in hive_create
@@ -188,7 +190,7 @@ def test_large_fixture_generates_exact_five_role_chain_deterministically(
 
     hive_insert = generated[expected_names[1]]
     assert (
-        "INSERT INTO TABLE `target_hive_db`.`large_table_physical` "
+        "INSERT INTO TABLE `target_hive_db`.`replica_large_table_physical` "
         f"(\n{hive_identifiers}\n)\n"
         f"SELECT\n{hive_identifiers}\n"
         "FROM `sample_source`.`large_table`;"
@@ -196,11 +198,12 @@ def test_large_fixture_generates_exact_five_role_chain_deterministically(
 
     greenplum_external = generated[expected_names[2]]
     assert (
-        f'CREATE EXTERNAL TABLE "ext"."large_table_ext" (\n{greenplum_definitions}\n)'
+        f'CREATE EXTERNAL TABLE "ext"."replica_large_table_ext" (\n{greenplum_definitions}\n)'
     ) in greenplum_external
     assert (
         "LOCATION (\n"
-        "  'pxf://target_hive_db.large_table_physical?PROFILE=hive&SERVER=default'\n"
+        "  'pxf://prx_replica_target_hive_db.replica_large_table_physical"
+        "?PROFILE=hive&SERVER=default'\n"
         ") ON ALL\n"
         "FORMAT 'CUSTOM' (FORMATTER='pxfwritable_import')\n"
         "ENCODING 'UTF8';"
@@ -210,7 +213,8 @@ def test_large_fixture_generates_exact_five_role_chain_deterministically(
 
     greenplum_create = generated[expected_names[3]]
     assert (
-        f'CREATE TABLE "dwh"."large_table" (\n{greenplum_definitions}\n)\nDISTRIBUTED RANDOMLY;'
+        f'CREATE TABLE "dwh"."replica_large_table" '
+        f"(\n{greenplum_definitions}\n)\nDISTRIBUTED RANDOMLY;"
     ) in greenplum_create
     assert "CREATE EXTERNAL TABLE" not in greenplum_create
     assert "PARTITIONED BY" not in greenplum_create
@@ -218,10 +222,10 @@ def test_large_fixture_generates_exact_five_role_chain_deterministically(
 
     greenplum_insert = generated[expected_names[4]]
     assert (
-        'INSERT INTO "dwh"."large_table" '
+        'INSERT INTO "dwh"."replica_large_table" '
         f"(\n{greenplum_identifiers}\n)\n"
         f"SELECT\n{greenplum_identifiers}\n"
-        'FROM "ext"."large_table_ext";'
+        'FROM "ext"."replica_large_table_ext";'
     ) in greenplum_insert
 
     all_sql = "\n".join(generated.values())
@@ -239,7 +243,7 @@ def test_large_fixture_generates_exact_five_role_chain_deterministically(
     regenerated = _generate(
         LARGE_DDL,
         output_directory,
-        repository_config=repository_config,
+        test_config_path=test_config_path,
         cwd=tmp_path,
     )
     second_bytes = {name: (output_directory / name).read_bytes() for name in expected_names}
@@ -250,7 +254,7 @@ def test_large_fixture_generates_exact_five_role_chain_deterministically(
 
 def test_comments_and_partition_columns_are_flattened_and_escaped(
     tmp_path: Path,
-    repository_config: Path,
+    test_config_path: Path,
 ) -> None:
     table = parse_hive_ddl(COMMENTS_DDL.read_text(encoding="utf-8"))[0]
 
@@ -271,14 +275,14 @@ def test_comments_and_partition_columns_are_flattened_and_escaped(
     generated = _generate(
         COMMENTS_DDL,
         tmp_path / "comments output",
-        repository_config=repository_config,
+        test_config_path=test_config_path,
         cwd=tmp_path,
     )
     expected_names = _artifact_names("source_db_events")
     assert tuple(generated) == expected_names
 
     hive_create = generated[expected_names[0]]
-    assert "CREATE TABLE `target_hive_db`.`events_physical`" in hive_create
+    assert "CREATE TABLE `target_hive_db`.`replica_events_physical`" in hive_create
     assert "`event_id` BIGINT COMMENT 'Идентификатор'" in hive_create
     assert "`owner` STRING COMMENT 'O\\'Brien'" in hive_create
     assert "`amount` DECIMAL(18, 2)" in hive_create
@@ -314,20 +318,23 @@ def test_comments_and_partition_columns_are_flattened_and_escaped(
         assert "'День события'" in create_sql
 
     assert (
-        "COMMENT ON TABLE \"ext\".\"events_ext\" IS 'События команды O''Brien';"
+        "COMMENT ON TABLE \"ext\".\"replica_events_ext\" IS 'События команды O''Brien';"
     ) in greenplum_external
     assert (
-        'COMMENT ON COLUMN "ext"."events_ext"."event_day" IS \'День события\';'
+        'COMMENT ON COLUMN "ext"."replica_events_ext"."event_day" IS \'День события\';'
     ) in greenplum_external
     assert (
-        "COMMENT ON TABLE \"dwh\".\"events\" IS 'События команды O''Brien';"
+        "COMMENT ON TABLE \"dwh\".\"replica_events\" IS 'События команды O''Brien';"
     ) in greenplum_create
-    assert ('COMMENT ON COLUMN "dwh"."events"."event_day" IS \'День события\';') in greenplum_create
     assert (
-        "pxf://target_hive_db.events_physical?PROFILE=hive&SERVER=default"
+        'COMMENT ON COLUMN "dwh"."replica_events"."event_day" IS \'День события\';'
+    ) in greenplum_create
+    assert (
+        "pxf://prx_replica_target_hive_db.replica_events_physical?PROFILE=hive&SERVER=default"
     ) in greenplum_external
     assert (
-        f'(\n{greenplum_identifiers}\n)\nSELECT\n{greenplum_identifiers}\nFROM "ext"."events_ext";'
+        f"(\n{greenplum_identifiers}\n)\nSELECT\n{greenplum_identifiers}\n"
+        'FROM "ext"."replica_events_ext";'
     ) in greenplum_insert
     assert "SELECT *" not in hive_insert.upper()
     assert "SELECT *" not in greenplum_insert.upper()
@@ -389,7 +396,7 @@ def test_unverified_hive_types_are_never_silently_mapped_to_text(
 
 def test_unsupported_mapping_has_context_and_prevents_all_outputs(
     tmp_path: Path,
-    repository_config: Path,
+    test_config_path: Path,
 ) -> None:
     input_directory = tmp_path / "input"
     input_directory.mkdir()
@@ -410,7 +417,7 @@ def test_unsupported_mapping_has_context_and_prevents_all_outputs(
         "--output",
         output_directory,
         "--config",
-        repository_config,
+        test_config_path,
         cwd=tmp_path,
         check=False,
     )
@@ -430,7 +437,7 @@ def test_unsupported_mapping_has_context_and_prevents_all_outputs(
         "--input",
         input_directory,
         "--config",
-        repository_config,
+        test_config_path,
         cwd=tmp_path,
         check=False,
     )
@@ -443,7 +450,7 @@ def test_unsupported_mapping_has_context_and_prevents_all_outputs(
 
 def test_two_tables_in_one_document_generate_two_complete_role_sets(
     tmp_path: Path,
-    repository_config: Path,
+    test_config_path: Path,
 ) -> None:
     ddl = tmp_path / "two_tables.sql"
     ddl.write_text(
@@ -457,7 +464,7 @@ def test_two_tables_in_one_document_generate_two_complete_role_sets(
     generated = _generate(
         ddl,
         output_directory,
-        repository_config=repository_config,
+        test_config_path=test_config_path,
         cwd=tmp_path,
     )
 
@@ -473,7 +480,7 @@ def test_two_tables_in_one_document_generate_two_complete_role_sets(
 
 def test_case_insensitive_multi_table_target_collision_writes_nothing(
     tmp_path: Path,
-    repository_config: Path,
+    test_config_path: Path,
 ) -> None:
     ddl = tmp_path / "colliding_tables.sql"
     ddl.write_text(
@@ -489,7 +496,7 @@ def test_case_insensitive_multi_table_target_collision_writes_nothing(
         "--output",
         output_directory,
         "--config",
-        repository_config,
+        test_config_path,
         cwd=tmp_path,
         check=False,
     )
@@ -503,28 +510,28 @@ def test_case_insensitive_multi_table_target_collision_writes_nothing(
     ("ddl_text", "expected_target", "expected_source"),
     (
         (
-            "CREATE TABLE target_hive_db.events_physical (id BIGINT);\n"
+            "CREATE TABLE target_hive_db.replica_events_physical (id BIGINT);\n"
             "CREATE TABLE source_db.events (id BIGINT);\n",
-            "target_hive_db.events_physical",
-            "target_hive_db.events_physical",
+            "target_hive_db.replica_events_physical",
+            "target_hive_db.replica_events_physical",
         ),
         (
             "CREATE TABLE source_db.events (id BIGINT);\n"
-            "CREATE TABLE target_hive_db.events_physical (id BIGINT);\n",
-            "target_hive_db.events_physical",
-            "target_hive_db.events_physical",
+            "CREATE TABLE target_hive_db.replica_events_physical (id BIGINT);\n",
+            "target_hive_db.replica_events_physical",
+            "target_hive_db.replica_events_physical",
         ),
         (
-            "CREATE TABLE TARGET_HIVE_DB.EVENTS_PHYSICAL (id BIGINT);\n"
+            "CREATE TABLE TARGET_HIVE_DB.REPLICA_EVENTS_PHYSICAL (id BIGINT);\n"
             "CREATE TABLE source_db.Events (id BIGINT);\n",
-            "target_hive_db.Events_physical",
-            "TARGET_HIVE_DB.EVENTS_PHYSICAL",
+            "target_hive_db.replica_Events_physical",
+            "TARGET_HIVE_DB.REPLICA_EVENTS_PHYSICAL",
         ),
     ),
 )
 def test_hive_target_cannot_overlap_any_source_table_in_batch(
     tmp_path: Path,
-    repository_config: Path,
+    test_config_path: Path,
     ddl_text: str,
     expected_target: str,
     expected_source: str,
@@ -540,7 +547,7 @@ def test_hive_target_cannot_overlap_any_source_table_in_batch(
         "--output",
         output_directory,
         "--config",
-        repository_config,
+        test_config_path,
         cwd=tmp_path,
         check=False,
     )
@@ -555,7 +562,7 @@ def test_hive_target_cannot_overlap_any_source_table_in_batch(
 
 def test_hive_source_target_overlap_uses_unicode_normalization(
     tmp_path: Path,
-    repository_config: Path,
+    test_config_path: Path,
 ) -> None:
     ddl = tmp_path / "unicode_source_target_collision.sql"
     decomposed_source_name = "Cafe\u0301"
@@ -566,18 +573,18 @@ def test_hive_source_target_overlap_uses_unicode_normalization(
         encoding="utf-8",
     )
     config = _modified_config(
-        repository_config,
+        test_config_path,
         tmp_path / "unicode_collision.yaml",
         (
-            'physical_table_name_template: "{source_table}_physical"',
+            'physical_table_name_template: "{replica}_{source_table}_physical"',
             'physical_table_name_template: "{source_database}"',
         ),
         (
-            'external_table_name_template: "{source_table}_ext"',
+            'external_table_name_template: "{replica}_{source_table}_ext"',
             'external_table_name_template: "{source_database}_ext"',
         ),
         (
-            'physical_table_name_template: "{source_table}"',
+            'physical_table_name_template: "{replica}_{source_table}"',
             'physical_table_name_template: "{source_database}"',
         ),
     )
@@ -604,7 +611,7 @@ def test_hive_source_target_overlap_uses_unicode_normalization(
 
 def test_recursive_multiple_input_files_generate_ten_artifacts(
     tmp_path: Path,
-    repository_config: Path,
+    test_config_path: Path,
 ) -> None:
     input_directory = tmp_path / "input"
     nested = input_directory / "nested"
@@ -625,7 +632,7 @@ def test_recursive_multiple_input_files_generate_ten_artifacts(
         "--output",
         tmp_path / "output",
         "--config",
-        repository_config,
+        test_config_path,
         cwd=tmp_path,
     )
     generated = _read_artifacts(tmp_path / "output")
@@ -640,10 +647,10 @@ def test_recursive_multiple_input_files_generate_ten_artifacts(
 
 def test_custom_filename_separator_keeps_stable_roles(
     tmp_path: Path,
-    repository_config: Path,
+    test_config_path: Path,
 ) -> None:
     config = _modified_config(
-        repository_config,
+        test_config_path,
         tmp_path / "custom.yaml",
         ('filename_separator: "__"', 'filename_separator: "-"'),
     )
@@ -651,7 +658,7 @@ def test_custom_filename_separator_keeps_stable_roles(
     generated = _generate(
         LARGE_DDL,
         tmp_path / "output",
-        repository_config=config,
+        test_config_path=config,
         cwd=tmp_path,
     )
 
@@ -662,36 +669,36 @@ def test_custom_filename_separator_keeps_stable_roles(
 
 def test_hive_overwrite_uses_explicit_select_without_unsupported_target_list(
     tmp_path: Path,
-    repository_config: Path,
+    test_config_path: Path,
 ) -> None:
     config = _modified_config(
-        repository_config,
+        test_config_path,
         tmp_path / "overwrite.yaml",
         ("insert_mode: into", "insert_mode: overwrite"),
     )
     generated = _generate(
         COMMENTS_DDL,
         tmp_path / "output",
-        repository_config=config,
+        test_config_path=config,
         cwd=tmp_path,
     )
 
     hive_insert = generated[_artifact_names("source_db_events")[1]]
     ordered_columns = ("event_id", "owner", "amount", "event_day")
     assert hive_insert.endswith(
-        "INSERT OVERWRITE TABLE `target_hive_db`.`events_physical`\n"
+        "INSERT OVERWRITE TABLE `target_hive_db`.`replica_events_physical`\n"
         "SELECT\n"
         f"{_hive_identifier_block(ordered_columns)}\n"
         "FROM `source_db`.`events`;\n"
     )
-    assert "INSERT OVERWRITE TABLE `target_hive_db`.`events_physical` (" not in hive_insert
+    assert "INSERT OVERWRITE TABLE `target_hive_db`.`replica_events_physical` (" not in hive_insert
     assert "SELECT *" not in hive_insert.upper()
 
 
 @pytest.mark.parametrize("table_name", ("orders-2026", "2026_orders"))
 def test_backtick_source_names_work_with_default_target_templates(
     tmp_path: Path,
-    repository_config: Path,
+    test_config_path: Path,
     table_name: str,
 ) -> None:
     ddl = tmp_path / "quoted_name.sql"
@@ -702,17 +709,17 @@ def test_backtick_source_names_work_with_default_target_templates(
     generated = _generate(
         ddl,
         tmp_path / "output",
-        repository_config=repository_config,
+        test_config_path=test_config_path,
         cwd=tmp_path,
     )
 
     stem = f"source_db_{table_name}"
     assert tuple(generated) == _artifact_names(stem)
     assert (
-        f"CREATE TABLE `target_hive_db`.`{table_name}_physical`"
+        f"CREATE TABLE `target_hive_db`.`replica_{table_name}_physical`"
         in generated[_artifact_names(stem)[0]]
     )
-    assert f'CREATE TABLE "dwh"."{table_name}"' in generated[_artifact_names(stem)[3]]
+    assert f'CREATE TABLE "dwh"."replica_{table_name}"' in generated[_artifact_names(stem)[3]]
 
 
 @pytest.mark.parametrize(
@@ -730,7 +737,7 @@ def test_backtick_source_names_work_with_default_target_templates(
 )
 def test_greenplum_identifier_byte_limit_is_checked_before_write(
     tmp_path: Path,
-    repository_config: Path,
+    test_config_path: Path,
     ddl_text: str,
     message: str,
 ) -> None:
@@ -745,7 +752,7 @@ def test_greenplum_identifier_byte_limit_is_checked_before_write(
         "--output",
         output,
         "--config",
-        repository_config,
+        test_config_path,
         cwd=tmp_path,
         check=False,
     )
@@ -757,7 +764,7 @@ def test_greenplum_identifier_byte_limit_is_checked_before_write(
 
 def test_ordinary_and_partition_column_collision_is_rejected_before_write(
     tmp_path: Path,
-    repository_config: Path,
+    test_config_path: Path,
 ) -> None:
     ddl = tmp_path / "duplicate_partition_column.sql"
     ddl.write_text(
@@ -774,7 +781,7 @@ def test_ordinary_and_partition_column_collision_is_rejected_before_write(
         "--output",
         output,
         "--config",
-        repository_config,
+        test_config_path,
         cwd=tmp_path,
         check=False,
     )
@@ -787,7 +794,7 @@ def test_ordinary_and_partition_column_collision_is_rejected_before_write(
 
 def test_source_and_hive_target_collision_is_rejected_before_write(
     tmp_path: Path,
-    repository_config: Path,
+    test_config_path: Path,
 ) -> None:
     ddl = tmp_path / "source.sql"
     ddl.write_text(
@@ -795,10 +802,10 @@ def test_source_and_hive_target_collision_is_rejected_before_write(
         encoding="utf-8",
     )
     config = _modified_config(
-        repository_config,
+        test_config_path,
         tmp_path / "collision.yaml",
         (
-            'physical_table_name_template: "{source_table}_physical"',
+            'physical_table_name_template: "{replica}_{source_table}_physical"',
             'physical_table_name_template: "{source_table}"',
         ),
     )
@@ -823,7 +830,7 @@ def test_source_and_hive_target_collision_is_rejected_before_write(
 
 def test_greenplum_external_and_physical_name_collision_is_rejected(
     tmp_path: Path,
-    repository_config: Path,
+    test_config_path: Path,
 ) -> None:
     ddl = tmp_path / "source.sql"
     ddl.write_text(
@@ -831,12 +838,12 @@ def test_greenplum_external_and_physical_name_collision_is_rejected(
         encoding="utf-8",
     )
     config = _modified_config(
-        repository_config,
+        test_config_path,
         tmp_path / "collision.yaml",
         ("physical_schema: dwh", "physical_schema: ext"),
         (
-            'external_table_name_template: "{source_table}_ext"',
-            'external_table_name_template: "{source_table}"',
+            'external_table_name_template: "{replica}_{source_table}_ext"',
+            'external_table_name_template: "{replica}_{source_table}"',
         ),
     )
     output = tmp_path / "output"

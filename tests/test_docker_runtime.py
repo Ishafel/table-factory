@@ -11,7 +11,7 @@ from collections.abc import Iterator
 from pathlib import Path
 
 import pytest
-from conftest import CONFIG_PATH, PROJECT_ROOT
+from conftest import PROJECT_ROOT, TEST_CONFIG_PATH
 
 RUN_DOCKER_TESTS = os.environ.get("TABLE_FACTORY_RUN_DOCKER_TESTS") == "1"
 DOCKER_SKIP_REASON = (
@@ -79,7 +79,7 @@ def mounted_case(example_ddl: Path) -> Iterator[dict[str, Path]]:
     ddl = input_dir / "таблица пример.sql"
     config = root / "table-factory.yaml"
     shutil.copyfile(example_ddl, ddl)
-    shutil.copyfile(CONFIG_PATH, config)
+    shutil.copyfile(TEST_CONFIG_PATH, config)
     try:
         yield {
             "root": root,

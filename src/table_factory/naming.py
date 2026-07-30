@@ -26,6 +26,7 @@ def _render_name_template(
     table: Table,
     *,
     label: str,
+    replica: str,
     max_utf8_bytes: int | None = None,
 ) -> str:
     if "{source_database}" in template and table.database is None:
@@ -33,6 +34,7 @@ def _render_name_template(
             f"{label} uses source_database, but source table {table.name} is not database-qualified"
         )
     rendered = template.format(
+        replica=replica,
         source_database=table.database or "",
         source_table=table.name,
     )
@@ -109,17 +111,20 @@ def build_target_names(table: Table, config: FactoryConfig) -> TargetNames:
         config.hive.physical_table_name_template,
         table,
         label="hive.physical_table_name_template",
+        replica=config.hive.replica,
     )
     external_table = _render_name_template(
         config.greenplum.external_table_name_template,
         table,
         label="greenplum.external_table_name_template",
+        replica=config.greenplum.replica,
         max_utf8_bytes=_GREENPLUM_IDENTIFIER_BYTES,
     )
     physical_table = _render_name_template(
         config.greenplum.physical_table_name_template,
         table,
         label="greenplum.physical_table_name_template",
+        replica=config.greenplum.replica,
         max_utf8_bytes=_GREENPLUM_IDENTIFIER_BYTES,
     )
 

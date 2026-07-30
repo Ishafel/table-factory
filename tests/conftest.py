@@ -10,7 +10,7 @@ from typing import Any
 import pytest
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-CONFIG_PATH = PROJECT_ROOT / "config" / "table-factory.yaml"
+TEST_CONFIG_PATH = PROJECT_ROOT / "tests" / "fixtures" / "table-factory.yaml"
 EXAMPLES_DIR = PROJECT_ROOT / "examples"
 
 
@@ -60,9 +60,9 @@ def parse_json_output(result: subprocess.CompletedProcess[str]) -> Any:
 
 
 @pytest.fixture(scope="session")
-def repository_config() -> Path:
-    assert CONFIG_PATH.is_file(), f"Missing repository config: {CONFIG_PATH}"
-    return CONFIG_PATH
+def test_config_path() -> Path:
+    assert TEST_CONFIG_PATH.is_file(), f"Missing test config: {TEST_CONFIG_PATH}"
+    return TEST_CONFIG_PATH
 
 
 @pytest.fixture(scope="session")
@@ -75,7 +75,7 @@ def example_ddl() -> Path:
 @pytest.fixture
 def cli_case(
     tmp_path: Path,
-    repository_config: Path,
+    test_config_path: Path,
     example_ddl: Path,
 ) -> dict[str, Path]:
     """A case whose every CLI path contains both spaces and non-ASCII characters."""
@@ -89,7 +89,7 @@ def cli_case(
     ddl_path = input_dir / "пример таблицы.sql"
     config_path = config_dir / "табличная фабрика.yaml"
     shutil.copyfile(example_ddl, ddl_path)
-    shutil.copyfile(repository_config, config_path)
+    shutil.copyfile(test_config_path, config_path)
 
     return {
         "root": root,

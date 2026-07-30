@@ -92,6 +92,10 @@ analytics_customer_orders__04_greenplum_create_physical.sql
 analytics_customer_orders__05_greenplum_insert.sql
 ```
 
+Значения `hive.replica` и `greenplum.replica` влияют на target table names,
+но не на имена файлов: filename stem по-прежнему строится только из source
+qualified name.
+
 Существующая output-директория автоматически не очищается. Все новые файлы
 сначала полностью записываются во временные файлы, после чего совпадающие
 destinations заменяются последовательно. При обычной ошибке записи утилита
@@ -216,7 +220,7 @@ Legacy-артефакты `create`, `drop`, `describe`, `show-create` и `analyz
 Первый файл содержит обычный `CREATE TABLE`, без `TEMPORARY`, `IF NOT EXISTS`,
 `EXTERNAL`, `LOCATION`, source storage, Spark properties, constraints,
 clustering, sorting, bucketing, skewing и partitioning. Target database и имя
-таблицы вычисляются из version 2 config. Namespace считается существующим и не
+таблицы вычисляются из version 3 config. Namespace считается существующим и не
 создаётся.
 
 Колонки сохраняют source-порядок и Hive-типы, включая параметры
@@ -242,28 +246,37 @@ columns явно и в том же порядке. `SELECT *` не исполь�
 `LOCATION` строится из `greenplum.external.location_template` и всегда
 подставляет имя новой физической Hive-таблицы, а не source-таблицы. Шаблон
 имеет фиксированную форму ресурса
-`pxf://{hive_database}.{hive_table}` и ровно два query-параметра:
+`pxf://prx_{replica}_{hive_database}.{hive_table}` и ровно два
+query-параметра:
 `PROFILE={profile}` и `SERVER={server}` (в любом порядке).
 
 Для стандартной конфигурации и `customer_orders` получится:
 
 ```text
-pxf://target_hive_db.customer_orders_physical?PROFILE=hive&SERVER=default
+pxf://prx_replica_target_hive_db.replica_customer_orders_physical?PROFILE=hive&SERVER=default
 ```
 
 Location template хранится в config, но его структура фиксирована validator:
-менять можно PXF server и порядок двух query-параметров, а database/table
-подставляются из вычисленного Hive target. Другие resource paths, query
+менять можно значения replicas, PXF server и порядок двух query-параметров.
+`{replica}` в этом шаблоне получает значение `greenplum.replica`,
+`{hive_database}` — `hive.target_database`, а `{hive_table}` — вычисленное
+имя Hive target с подставленным `hive.replica`. Другие resource paths, query
 parameters и profiles текущая schema не принимает. End-to-end-контракт
 разрешает только Hive profile и:
 
 ```sql
 LOCATION (
-  'pxf://target_hive_db.customer_orders_physical?PROFILE=hive&SERVER=default'
+  'pxf://prx_replica_target_hive_db.replica_customer_orders_physical?PROFILE=hive&SERVER=default'
 ) ON ALL
 FORMAT 'CUSTOM' (FORMATTER='pxfwritable_import')
 ENCODING 'UTF8';
 ```
+
+Ресурс PXF использует database alias
+`prx_<greenplum.replica>_<hive.target_database>`, а не буквальное имя database
+из Hive `CREATE TABLE`. Контракт предполагает, что целевая PXF/Hive-среда уже
+публикует такой alias и направляет его в `hive.target_database`. Утилита этот
+alias не создаёт и не проверяет.
 
 Это согласовано с чтением настроенной Hive `TEXTFILE`-таблицы через PXF Hive
 profile. `ON ALL` и UTF-8 encoding являются фиксированной частью
@@ -386,17 +399,21 @@ ORC, Parquet и другие target formats отклоняются, пока о�
 Source при этом может быть Parquet или использовать SerDe/InputFormat:
 source storage разбирается, но не копируется.
 
-## Version 2 config
+## Version 3 config
 
 Путь к YAML-конфигурации обязателен для `generate`, `validate` и `inspect`.
 Автоматического поиска config нет. Все показанные ниже поля обязательны;
 неизвестные, отсутствующие и повторяющиеся mapping keys на любом уровне
 отклоняются.
 
-Актуальный [`config/table-factory.yaml`](config/table-factory.yaml):
+[`config/table-factory.yaml`](config/table-factory.yaml) — пользовательский
+runtime-конфиг и пример для локального запуска. Его можно менять под конкретное
+окружение, включая database, schema и replica; тесты от его значений не зависят.
+
+Пример runtime-конфига:
 
 ```yaml
-version: 2
+version: 3
 
 output:
   include_source_comment: true
@@ -404,7 +421,8 @@ output:
 
 hive:
   target_database: target_hive_db
-  physical_table_name_template: "{source_table}_physical"
+  replica: replica
+  physical_table_name_template: "{replica}_{source_table}_physical"
   insert_mode: into
   storage:
     format: textfile
@@ -416,12 +434,13 @@ greenplum:
   database: target_gp_database
   external_schema: ext
   physical_schema: dwh
-  external_table_name_template: "{source_table}_ext"
-  physical_table_name_template: "{source_table}"
+  replica: replica
+  external_table_name_template: "{replica}_{source_table}_ext"
+  physical_table_name_template: "{replica}_{source_table}"
   distribution:
     mode: random
   external:
-    location_template: "pxf://{hive_database}.{hive_table}?PROFILE={profile}&SERVER={server}"
+    location_template: "pxf://prx_{replica}_{hive_database}.{hive_table}?PROFILE={profile}&SERVER={server}"
     profile: hive
     server: default
     format:
@@ -429,17 +448,18 @@ greenplum:
       formatter: pxfwritable_import
 ```
 
-Version 1 несовместима с новым workflow и не получает неявных defaults:
-загрузка завершается сообщением о миграции на version 2.
+Конфиги v1 и v2 больше не поддерживаются и не получают неявных defaults:
+их загрузка завершается сообщением о необходимости миграции на v3.
 
 ### Поля config
 
 | Поле | Тип и допустимые значения | Назначение |
 | --- | --- | --- |
-| `version` | integer, только `2` | Версия несовместимой v2 schema |
+| `version` | integer, только `3` | Версия несовместимой v3 schema |
 | `output.include_source_comment` | boolean | Добавлять безопасный header с basename source-файла |
 | `output.filename_separator` | string из `.`/`_`/`-`, длина `1..8` | Разделять portable stem и стабильную роль файла |
 | `hive.target_database` | непустой unqualified identifier | Database новой физической Hive table |
+| `hive.replica` | ASCII fragment `[A-Za-z0-9_][A-Za-z0-9_-]*` | Значение `{replica}` в Hive name template |
 | `hive.physical_table_name_template` | безопасный name template | Имя новой Hive table |
 | `hive.insert_mode` | `into` или `overwrite` | Режим Hive INSERT |
 | `hive.storage.format` | только `textfile` | End-to-end storage новой Hive table |
@@ -449,6 +469,7 @@ Version 1 несовместима с новым workflow и не получае
 | `greenplum.database` | непустой unqualified identifier, не более 63 UTF-8 bytes | Database execution/connection context |
 | `greenplum.external_schema` | непустой unqualified identifier, не более 63 UTF-8 bytes | Schema external table |
 | `greenplum.physical_schema` | непустой unqualified identifier, не более 63 UTF-8 bytes | Schema physical table |
+| `greenplum.replica` | ASCII fragment `[A-Za-z0-9_][A-Za-z0-9_-]*` | Значение `{replica}` в Greenplum name templates и PXF LOCATION |
 | `greenplum.external_table_name_template` | безопасный name template | Имя external table |
 | `greenplum.physical_table_name_template` | безопасный name template | Имя physical table |
 | `greenplum.distribution.mode` | только `random` | `DISTRIBUTED RANDOMLY` |
@@ -463,6 +484,12 @@ Database и schema должны быть одиночными identifiers из A
 Greenplum database, schema, вычисленные table names и column names не могут
 превышать 63 bytes в UTF-8.
 
+Оба поля `replica` обязательны и должны быть непустыми ASCII-фрагментами:
+первый символ — letter, digit или underscore, остальные — letters, digits,
+underscores или hyphens. Точки запрещены, чтобы replica не могла изменить
+границы `database.table` в PXF resource; URI separators и braces также
+запрещены.
+
 Значения `hive.storage.format`, `hive.insert_mode`,
 `greenplum.distribution.mode`, `greenplum.external.format.kind` и
 `greenplum.external.format.formatter` принимаются без учёта регистра и
@@ -472,30 +499,41 @@ Greenplum database, schema, вычисленные table names и column names �
 Name templates разрешают literal-фрагменты только из ASCII
 `[A-Za-z0-9_]*` и placeholders:
 
+- `{replica}`;
 - `{source_database}`;
 - `{source_table}`.
 
+В `hive.physical_table_name_template` `{replica}` означает `hive.replica`.
+В `greenplum.external_table_name_template` и
+`greenplum.physical_table_name_template` он означает `greenplum.replica`.
 Неизвестные placeholders, format specs, conversions и другие literal
 characters отклоняются. Например, literal hyphen в
-`{source_table}-physical` недопустим. Unicode и hyphen могут попасть в
-результат только из значения source placeholder. Результат шаблона может
-содержать только Unicode letters/digits, underscore и hyphen, в том числе
-начинаться с цифры: target identifier всегда корректно quoted. Backticks
-расширяют синтаксис source identifier, но не допустимый алфавит target: если
-подставленное source-значение содержит другие символы, semantic preflight
-отклонит результат. Поддерживаются, например, source identifiers
-`` `orders-2026` `` и `` `2026_orders` ``. Если source не квалифицирован
-database, шаблон с `{source_database}` использовать нельзя. Вычисленные
-Greenplum table names дополнительно ограничены 63 UTF-8 bytes.
+`{source_table}-physical` недопустим. Unicode может попасть в результат только
+из source placeholder, а hyphen — из source или replica placeholder.
+Результат шаблона может содержать только Unicode letters/digits, underscore и
+hyphen, в том числе начинаться с цифры: target identifier всегда корректно
+quoted. Backticks расширяют синтаксис source identifier, но не допустимый
+алфавит target: если подставленное source-значение содержит другие символы,
+semantic preflight отклонит результат. Поддерживаются, например, source
+identifiers `` `orders-2026` `` и `` `2026_orders` ``. Если source не
+квалифицирован database, шаблон с `{source_database}` использовать нельзя.
+Вычисленные Greenplum table names дополнительно ограничены 63 UTF-8 bytes.
 
 `greenplum.external.location_template`:
 
 - должен иметь ресурс ровно
-  `pxf://{hive_database}.{hive_table}`;
+  `pxf://prx_{replica}_{hive_database}.{hive_table}`;
 - обязан содержать только два query-параметра:
   `PROFILE={profile}` и `SERVER={server}`; допускается любой их порядок;
 - не допускает credentials, дополнительных query-параметров, других
   placeholders, format specs или произвольных SQL fragments.
+
+Здесь `{replica}` всегда означает `greenplum.replica`. После подстановки
+database component имеет вид
+`prx_<greenplum.replica>_<hive.target_database>`. Это PXF-visible alias,
+который deployment должен заранее сопоставить с Hive database
+`hive.target_database`; совпадение и существование alias локально не
+проверяются.
 
 В config нет полей credentials. Не помещайте secrets в URI или name
 templates.
@@ -506,10 +544,11 @@ templates.
 
 | Объект | Вычисленное имя |
 | --- | --- |
-| Hive physical | `` `target_hive_db`.`customer_orders_physical` `` |
-| Greenplum external | `"ext"."customer_orders_ext"` |
-| Greenplum physical | `"dwh"."customer_orders"` |
+| Hive physical | `` `target_hive_db`.`replica_customer_orders_physical` `` |
+| Greenplum external | `"ext"."replica_customer_orders_ext"` |
+| Greenplum physical | `"dwh"."replica_customer_orders"` |
 | Greenplum execution database | `target_gp_database` |
+| PXF resource | `pxf://prx_replica_target_hive_db.replica_customer_orders_physical` |
 
 Каждый Hive target сравнивается со всеми source tables текущей партии, а не
 только со своим source. Поэтому target одной таблицы не может совпасть с
@@ -534,8 +573,8 @@ Filename stem строится из source qualified name, а не target name. 
 Сгенерированный SQL использует корректные двухчастные имена:
 
 ```sql
-"ext"."customer_orders_ext"
-"dwh"."customer_orders"
+"ext"."replica_customer_orders_ext"
+"dwh"."replica_customer_orders"
 ```
 
 Он не генерирует неподдержанное
@@ -589,7 +628,7 @@ docker compose run --rm table-factory inspect \
 `inspect` принимает один SQL-файл и выводит UTF-8 JSON, содержащий:
 
 - безопасный source path label без абсолютного host path;
-- полную effective version 2 config;
+- полную effective version 3 config;
 - source database, table, qualified name и `external` flag;
 - отдельные ordinary и partition columns, Hive types и comments;
 - table comment;
@@ -643,6 +682,12 @@ traceback и не раскрывают абсолютные host paths.
 Все основные проверки запускаются из корня репозитория без target Hive,
 Greenplum или PXF. На Unix используйте `LOCAL_UID`/`LOCAL_GID`, экспортированные
 в разделе быстрого старта:
+
+Функциональные и golden-тесты используют отдельный
+[`tests/fixtures/table-factory.yaml`](tests/fixtures/table-factory.yaml).
+Пользовательский `config/table-factory.yaml` читает только contract-проверка
+валидности v3, не фиксирующая конкретные database, schema или replica. Поэтому
+изменение этих runtime-значений не должно ломать тесты.
 
 ```bash
 docker compose config --quiet
@@ -732,11 +777,14 @@ wheel-вариант CLI не подключается к target systems.
   Hive profile с `CUSTOM/pxfwritable_import`.
 - Greenplum distribution policy ограничена `DISTRIBUTED RANDOMLY`.
 - Target Hive/Greenplum database и schemas должны существовать заранее.
+- PXF/Hive deployment должен заранее публиковать database alias
+  `prx_<greenplum.replica>_<hive.target_database>`; утилита не создаёт и не
+  проверяет это сопоставление.
 - Hive `INSERT INTO` использует target column list; `INSERT OVERWRITE`
   использует детерминированный порядок target DDL и явный source `SELECT`,
   поскольку target column list в этой форме грамматикой Hive не поддерживается.
-- В config настраивается PXF server и порядок двух query-параметров, но не
-  структура URI, profile, formatter или дополнительные параметры. Если
+- В config настраиваются replicas, PXF server и порядок двух query-параметров,
+  но не структура URI, profile, formatter или дополнительные параметры. Если
   deployment требует другой контракт, текущую schema и renderer нужно
   расширить; сгенерированный SQL необходимо проверить в целевой среде.
 - Clause `LOCATION (...) ON ALL` зафиксирован для целевого Greenplum/ADB

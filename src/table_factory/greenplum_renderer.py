@@ -39,6 +39,7 @@ def _comments(plan: TablePlan, *, schema: str, table: str) -> str:
 def _external_location(plan: TablePlan, config: FactoryConfig) -> str:
     external = config.greenplum.external
     return external.location_template.format(
+        replica=config.greenplum.replica,
         hive_database=plan.targets.hive_database,
         hive_table=plan.targets.hive_table,
         profile=external.profile,

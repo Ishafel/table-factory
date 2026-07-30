@@ -9,16 +9,19 @@ import yaml
 
 from table_factory.config import load_config
 from table_factory.errors import ConfigurationError
+from table_factory.generator import render_artifacts
+from table_factory.parser import parse_hive_ddl
 
 VALID_CONFIG: dict[str, Any] = {
-    "version": 2,
+    "version": 3,
     "output": {
         "include_source_comment": True,
         "filename_separator": "__",
     },
     "hive": {
         "target_database": "target_hive_db",
-        "physical_table_name_template": "{source_database}_{source_table}_physical",
+        "replica": "hive_r",
+        "physical_table_name_template": "{replica}_{source_table}_physical",
         "insert_mode": "into",
         "storage": {
             "format": "textfile",
@@ -31,14 +34,15 @@ VALID_CONFIG: dict[str, Any] = {
         "database": "target_gp_database",
         "external_schema": "ext",
         "physical_schema": "dwh",
-        "external_table_name_template": "{source_table}_ext",
-        "physical_table_name_template": "{source_table}",
+        "replica": "gp_r",
+        "external_table_name_template": "{replica}_{source_table}_ext",
+        "physical_table_name_template": "{replica}_{source_table}",
         "distribution": {
             "mode": "random",
         },
         "external": {
             "location_template": (
-                "pxf://{hive_database}.{hive_table}?PROFILE={profile}&SERVER={server}"
+                "pxf://prx_{replica}_{hive_database}.{hive_table}?PROFILE={profile}&SERVER={server}"
             ),
             "profile": "hive",
             "server": "default",
@@ -95,16 +99,17 @@ def _load(tmp_path: Path, raw: object) -> Any:
     return load_config(path, display_name=path.name)
 
 
-def test_version_2_configuration_loads_all_supported_settings(
+def test_version_3_configuration_loads_all_supported_settings(
     tmp_path: Path,
 ) -> None:
     config = _load(tmp_path, VALID_CONFIG)
 
-    assert config.version == 2
+    assert config.version == 3
     assert config.output.include_source_comment is True
     assert config.output.filename_separator == "__"
     assert config.hive.target_database == "target_hive_db"
-    assert config.hive.physical_table_name_template == "{source_database}_{source_table}_physical"
+    assert config.hive.replica == "hive_r"
+    assert config.hive.physical_table_name_template == "{replica}_{source_table}_physical"
     assert config.hive.insert_mode == "into"
     assert config.hive.storage.format == "textfile"
     assert config.hive.storage.field_delimiter == ","
@@ -113,11 +118,12 @@ def test_version_2_configuration_loads_all_supported_settings(
     assert config.greenplum.database == "target_gp_database"
     assert config.greenplum.external_schema == "ext"
     assert config.greenplum.physical_schema == "dwh"
-    assert config.greenplum.external_table_name_template == "{source_table}_ext"
-    assert config.greenplum.physical_table_name_template == "{source_table}"
+    assert config.greenplum.replica == "gp_r"
+    assert config.greenplum.external_table_name_template == "{replica}_{source_table}_ext"
+    assert config.greenplum.physical_table_name_template == "{replica}_{source_table}"
     assert config.greenplum.distribution.mode == "random"
     assert config.greenplum.external.location_template == (
-        "pxf://{hive_database}.{hive_table}?PROFILE={profile}&SERVER={server}"
+        "pxf://prx_{replica}_{hive_database}.{hive_table}?PROFILE={profile}&SERVER={server}"
     )
     assert config.greenplum.external.profile == "hive"
     assert config.greenplum.external.server == "default"
@@ -126,11 +132,13 @@ def test_version_2_configuration_loads_all_supported_settings(
     assert config.as_dict() == VALID_CONFIG
 
 
-def test_version_1_configuration_has_an_explicit_migration_error(
+@pytest.mark.parametrize("version", [1, 2], ids=["v1", "v2"])
+def test_versions_1_and_2_have_explicit_migration_errors(
     tmp_path: Path,
+    version: int,
 ) -> None:
     old_config = {
-        "version": 1,
+        "version": version,
         "dialect": "hive",
         "output": {
             "include_source_comment": True,
@@ -138,23 +146,24 @@ def test_version_1_configuration_has_an_explicit_migration_error(
         },
     }
 
-    with pytest.raises(
-        ConfigurationError,
-        match=r"version 1 .*no longer supported.*migrate to version 2",
-    ):
+    with pytest.raises(ConfigurationError) as captured:
         _load(tmp_path, old_config)
+
+    assert str(captured.value) == (
+        f"configuration version {version} is no longer supported; migrate to version 3"
+    )
 
 
 @pytest.mark.parametrize(
     ("contents", "line", "column"),
     [
         (
-            "version: 1\nversion: 2\n",
+            "version: 2\nversion: 3\n",
             2,
             1,
         ),
         (
-            "version: 2\nhive:\n  target_database: first\n  target_database: second\n",
+            "version: 3\nhive:\n  target_database: first\n  target_database: second\n",
             4,
             3,
         ),
@@ -181,17 +190,34 @@ def test_configuration_rejects_duplicate_mapping_keys_at_every_level(
 
 
 @pytest.mark.parametrize(
+    "value",
+    [True, False, "3", 3.0, None, [], {}, 0, 4],
+    ids=[
+        "true",
+        "false",
+        "string",
+        "float",
+        "null",
+        "sequence",
+        "mapping",
+        "zero",
+        "future",
+    ],
+)
+def test_configuration_requires_version_3_as_an_integer(
+    tmp_path: Path,
+    value: object,
+) -> None:
+    with pytest.raises(ConfigurationError) as captured:
+        _load(tmp_path, _changed("version", value))
+
+    assert str(captured.value) == "configuration version must be 3"
+
+
+@pytest.mark.parametrize(
     ("raw", "message"),
     [
         ([], "configuration must be a YAML mapping"),
-        (
-            _changed("version", True),
-            "configuration version must be 2",
-        ),
-        (
-            _changed("version", "2"),
-            "configuration version must be 2",
-        ),
         (
             _changed("output", []),
             "output must be a YAML mapping",
@@ -205,8 +231,16 @@ def test_configuration_rejects_duplicate_mapping_keys_at_every_level(
             "hive.target_database must be a string",
         ),
         (
+            _changed("hive.replica", None),
+            "hive.replica must be a string",
+        ),
+        (
             _changed("hive.storage", "textfile"),
             "hive.storage must be a YAML mapping",
+        ),
+        (
+            _changed("greenplum.replica", 7),
+            "greenplum.replica must be a string",
         ),
         (
             _changed("greenplum.distribution.mode", False),
@@ -230,6 +264,7 @@ def test_configuration_rejects_wrong_value_types(
 @pytest.mark.parametrize(
     ("path", "message"),
     [
+        ("version", "configuration is missing required key: version"),
         ("greenplum", "configuration is missing required key: greenplum"),
         (
             "output.filename_separator",
@@ -240,12 +275,20 @@ def test_configuration_rejects_wrong_value_types(
             "hive is missing required key: target_database",
         ),
         (
+            "hive.replica",
+            "hive is missing required key: replica",
+        ),
+        (
             "hive.storage.null_value",
             "hive.storage is missing required key: null_value",
         ),
         (
             "greenplum.external_schema",
             "greenplum is missing required key: external_schema",
+        ),
+        (
+            "greenplum.replica",
+            "greenplum is missing required key: replica",
         ),
         (
             "greenplum.distribution.mode",
@@ -356,6 +399,87 @@ def test_greenplum_namespaces_reject_more_than_63_utf8_bytes(
 
 
 @pytest.mark.parametrize(
+    ("path", "value"),
+    [
+        ("hive.replica", "0"),
+        ("hive.replica", "_"),
+        ("hive.replica", "hive-replica_01"),
+        ("greenplum.replica", "9"),
+        ("greenplum.replica", "_gp"),
+        ("greenplum.replica", "gp-replica_01"),
+    ],
+)
+def test_replica_fragments_accept_supported_ascii_identifiers(
+    tmp_path: Path,
+    path: str,
+    value: str,
+) -> None:
+    config = _load(tmp_path, _changed(path, value))
+
+    section = config.hive if path.startswith("hive.") else config.greenplum
+    assert section.replica == value
+
+
+@pytest.mark.parametrize("path", ["hive.replica", "greenplum.replica"])
+def test_replica_fragments_reject_empty_values(
+    tmp_path: Path,
+    path: str,
+) -> None:
+    with pytest.raises(
+        ConfigurationError,
+        match=rf"{path} must not be empty",
+    ):
+        _load(tmp_path, _changed(path, ""))
+
+
+@pytest.mark.parametrize(
+    ("path", "value"),
+    [
+        ("hive.replica", "-hive"),
+        ("hive.replica", "hive.replica"),
+        ("hive.replica", "hive replica"),
+        ("hive.replica", "реплика"),
+        ("greenplum.replica", "-gp"),
+        ("greenplum.replica", "gp/replica"),
+        ("greenplum.replica", "réplica"),
+    ],
+)
+def test_replica_fragments_reject_unsafe_values(
+    tmp_path: Path,
+    path: str,
+    value: str,
+) -> None:
+    with pytest.raises(
+        ConfigurationError,
+        match=(
+            rf"{path} must be an ASCII identifier fragment starting with a letter, "
+            r"digit or underscore and containing only letters, digits, underscores and hyphens"
+        ),
+    ):
+        _load(tmp_path, _changed(path, value))
+
+
+def test_replica_placeholders_resolve_from_their_own_sections(
+    tmp_path: Path,
+) -> None:
+    config = _load(tmp_path, VALID_CONFIG)
+    table = parse_hive_ddl("CREATE TABLE source_db.events (id BIGINT);")[0]
+
+    artifacts = render_artifacts(
+        table,
+        config=config,
+        source_label="events.sql",
+    )
+
+    assert "CREATE TABLE `target_hive_db`.`hive_r_events_physical`" in artifacts[0].content
+    assert 'CREATE EXTERNAL TABLE "ext"."gp_r_events_ext"' in artifacts[2].content
+    assert (
+        "pxf://prx_gp_r_target_hive_db.hive_r_events_physical?PROFILE=hive&SERVER=default"
+    ) in artifacts[2].content
+    assert 'CREATE TABLE "dwh"."gp_r_events"' in artifacts[3].content
+
+
+@pytest.mark.parametrize(
     "path",
     [
         "hive.physical_table_name_template",
@@ -378,15 +502,20 @@ def test_name_templates_reject_unknown_placeholders(
     ("value", "message"),
     [
         (
-            "pxf://{hive_database}.{hive_table}?PROFILE={profile}&SERVER={server}&USER={user}",
+            "pxf://prx_{replica}_{hive_database}.{hive_table}"
+            "?PROFILE={profile}&SERVER={server}&USER={user}",
             "contains unknown placeholder: user",
         ),
         (
-            "pxf://{hive_database}.{hive_table}?PROFILE={profile}",
+            "pxf://prx_{replica}_{hive_database}.{hive_table}?PROFILE={profile}",
             "is missing required placeholder: server",
         ),
         (
-            "https://{hive_database}.{hive_table}?PROFILE={profile}&SERVER={server}",
+            "pxf://prx_{hive_database}.{hive_table}?PROFILE={profile}&SERVER={server}",
+            "is missing required placeholder: replica",
+        ),
+        (
+            "https://prx_{replica}_{hive_database}.{hive_table}?PROFILE={profile}&SERVER={server}",
             "must start with 'pxf://'",
         ),
     ],
@@ -409,11 +538,13 @@ def test_location_template_enforces_its_placeholder_contract(
 @pytest.mark.parametrize(
     "value",
     [
-        "pxf://{hive_table}.{hive_database}?PROFILE={profile}&SERVER={server}",
-        ("pxf://{hive_database}.{hive_table}?PROFILE={profile}&SERVER={server}&PASSWORD=secret"),
-        "pxf://{hive_database}/{hive_table}?PROFILE={profile}&SERVER={server}",
-        "pxf://{hive_database}.{hive_table}?PROFILE={server}&SERVER={profile}",
-        "pxf://{hive_database}.{hive_table}?profile={profile}&SERVER={server}",
+        "pxf://prx_{replica}_{hive_table}.{hive_database}?PROFILE={profile}&SERVER={server}",
+        "pxf://{replica}_{hive_database}.{hive_table}?PROFILE={profile}&SERVER={server}",
+        "pxf://prx_{replica}_{hive_database}.{hive_table}"
+        "?PROFILE={profile}&SERVER={server}&PASSWORD=secret",
+        "pxf://prx_{replica}_{hive_database}/{hive_table}?PROFILE={profile}&SERVER={server}",
+        "pxf://prx_{replica}_{hive_database}.{hive_table}?PROFILE={server}&SERVER={profile}",
+        "pxf://prx_{replica}_{hive_database}.{hive_table}?profile={profile}&SERVER={server}",
     ],
 )
 def test_location_template_rejects_semantic_variants(
@@ -424,7 +555,7 @@ def test_location_template_rejects_semantic_variants(
         ConfigurationError,
         match=(
             r"greenplum.external.location_template must use "
-            r"'pxf://\{hive_database\}\.\{hive_table\}' and only "
+            r"'pxf://prx_\{replica\}_\{hive_database\}\.\{hive_table\}' and only "
             r"PROFILE=\{profile\} and SERVER=\{server\} query parameters"
         ),
     ):
@@ -437,7 +568,7 @@ def test_location_template_rejects_semantic_variants(
 def test_location_template_rejects_escaped_required_braces(
     tmp_path: Path,
 ) -> None:
-    value = "pxf://{{hive_database}}.{hive_table}?PROFILE={profile}&SERVER={server}"
+    value = "pxf://prx_{replica}_{{hive_database}}.{hive_table}?PROFILE={profile}&SERVER={server}"
 
     with pytest.raises(
         ConfigurationError,
@@ -455,7 +586,7 @@ def test_location_template_rejects_escaped_required_braces(
 def test_location_template_accepts_profile_and_server_in_reversed_order(
     tmp_path: Path,
 ) -> None:
-    value = "pxf://{hive_database}.{hive_table}?SERVER={server}&PROFILE={profile}"
+    value = "pxf://prx_{replica}_{hive_database}.{hive_table}?SERVER={server}&PROFILE={profile}"
 
     config = _load(
         tmp_path,
@@ -485,7 +616,7 @@ def test_location_template_accepts_profile_and_server_in_reversed_order(
         ),
         (
             "greenplum.external.location_template",
-            "pxf://{hive_database}.{hive_table}'?PROFILE={profile}&SERVER={server}",
+            "pxf://prx_{replica}_{hive_database}.{hive_table}'?PROFILE={profile}&SERVER={server}",
             "contains unsafe URI characters",
         ),
     ],

@@ -1,4 +1,4 @@
-"""Strict version 2 configuration loading for table-factory."""
+"""Strict version 3 configuration loading for table-factory."""
 
 from __future__ import annotations
 
@@ -17,11 +17,14 @@ from table_factory.errors import ConfigurationError
 
 _SQL_NAMESPACE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 _SAFE_TOKEN = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]*\Z")
+_SAFE_REPLICA = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_-]*\Z")
 _SAFE_TEMPLATE_LITERAL = re.compile(r"[A-Za-z0-9_]*\Z")
 _SAFE_LOCATION = re.compile(r"[A-Za-z0-9:/?&=._%+{}-]+\Z")
-_NAME_PLACEHOLDERS = frozenset({"source_database", "source_table"})
-_LOCATION_PLACEHOLDERS = frozenset({"hive_database", "hive_table", "profile", "server"})
+_NAME_PLACEHOLDERS = frozenset({"replica", "source_database", "source_table"})
+_LOCATION_PLACEHOLDERS = frozenset({"replica", "hive_database", "hive_table", "profile", "server"})
 _GREENPLUM_IDENTIFIER_BYTES = 63
+_CONFIG_VERSION = 3
+_LEGACY_CONFIG_VERSIONS = frozenset({1, 2})
 
 
 class _UniqueKeySafeLoader(yaml.SafeLoader):
@@ -71,7 +74,8 @@ class HiveStorageConfig:
 @dataclass(frozen=True, slots=True)
 class HiveConfig:
     target_database: str = "target_hive_db"
-    physical_table_name_template: str = "{source_table}_physical"
+    replica: str = "replica"
+    physical_table_name_template: str = "{replica}_{source_table}_physical"
     insert_mode: str = "into"
     storage: HiveStorageConfig = field(default_factory=HiveStorageConfig)
 
@@ -89,7 +93,9 @@ class GreenplumExternalFormatConfig:
 
 @dataclass(frozen=True, slots=True)
 class GreenplumExternalConfig:
-    location_template: str = "pxf://{hive_database}.{hive_table}?PROFILE={profile}&SERVER={server}"
+    location_template: str = (
+        "pxf://prx_{replica}_{hive_database}.{hive_table}?PROFILE={profile}&SERVER={server}"
+    )
     profile: str = "hive"
     server: str = "default"
     format: GreenplumExternalFormatConfig = field(default_factory=GreenplumExternalFormatConfig)
@@ -100,8 +106,9 @@ class GreenplumConfig:
     database: str = "target_gp_database"
     external_schema: str = "ext"
     physical_schema: str = "dwh"
-    external_table_name_template: str = "{source_table}_ext"
-    physical_table_name_template: str = "{source_table}"
+    replica: str = "replica"
+    external_table_name_template: str = "{replica}_{source_table}_ext"
+    physical_table_name_template: str = "{replica}_{source_table}"
     distribution: GreenplumDistributionConfig = field(default_factory=GreenplumDistributionConfig)
     external: GreenplumExternalConfig = field(default_factory=GreenplumExternalConfig)
 
@@ -110,7 +117,7 @@ class GreenplumConfig:
 class FactoryConfig:
     """Validated settings for the source-to-target SQL workflow."""
 
-    version: int = 2
+    version: int = _CONFIG_VERSION
     output: OutputConfig = field(default_factory=OutputConfig)
     hive: HiveConfig = field(default_factory=HiveConfig)
     greenplum: GreenplumConfig = field(default_factory=GreenplumConfig)
@@ -135,6 +142,7 @@ class FactoryConfig:
             },
             "hive": {
                 "target_database": self.hive.target_database,
+                "replica": self.hive.replica,
                 "physical_table_name_template": (self.hive.physical_table_name_template),
                 "insert_mode": self.hive.insert_mode,
                 "storage": {
@@ -148,6 +156,7 @@ class FactoryConfig:
                 "database": self.greenplum.database,
                 "external_schema": self.greenplum.external_schema,
                 "physical_schema": self.greenplum.physical_schema,
+                "replica": self.greenplum.replica,
                 "external_table_name_template": (self.greenplum.external_table_name_template),
                 "physical_table_name_template": (self.greenplum.physical_table_name_template),
                 "distribution": {
@@ -212,6 +221,16 @@ def _namespace(
         )
     if max_utf8_bytes is not None and len(result.encode("utf-8")) > max_utf8_bytes:
         raise ConfigurationError(f"{label} must contain at most {max_utf8_bytes} UTF-8 bytes")
+    return result
+
+
+def _replica(value: object, label: str) -> str:
+    result = _string_value(value, label)
+    if _SAFE_REPLICA.fullmatch(result) is None:
+        raise ConfigurationError(
+            f"{label} must be an ASCII identifier fragment starting with a letter, "
+            "digit or underscore and containing only letters, digits, underscores and hyphens"
+        )
     return result
 
 
@@ -339,6 +358,7 @@ def _load_hive(raw_value: object) -> HiveConfig:
     allowed = frozenset(
         {
             "target_database",
+            "replica",
             "physical_table_name_template",
             "insert_mode",
             "storage",
@@ -350,6 +370,7 @@ def _load_hive(raw_value: object) -> HiveConfig:
         raise ConfigurationError("hive.insert_mode must be 'into' or 'overwrite'")
     return HiveConfig(
         target_database=_namespace(raw["target_database"], "hive.target_database"),
+        replica=_replica(raw["replica"], "hive.replica"),
         physical_table_name_template=_name_template(
             raw["physical_table_name_template"],
             "hive.physical_table_name_template",
@@ -399,7 +420,7 @@ def _location_template(value: object) -> str:
     if not result.lower().startswith("pxf://"):
         raise ConfigurationError(f"{label} must start with 'pxf://'")
     resource, separator, query = result.partition("?")
-    expected_resource = "pxf://{hive_database}.{hive_table}"
+    expected_resource = "pxf://prx_{replica}_{hive_database}.{hive_table}"
     expected_parameters = {
         "PROFILE={profile}",
         "SERVER={server}",
@@ -447,6 +468,7 @@ def _load_greenplum(raw_value: object) -> GreenplumConfig:
             "database",
             "external_schema",
             "physical_schema",
+            "replica",
             "external_table_name_template",
             "physical_table_name_template",
             "distribution",
@@ -470,6 +492,7 @@ def _load_greenplum(raw_value: object) -> GreenplumConfig:
             "greenplum.physical_schema",
             max_utf8_bytes=_GREENPLUM_IDENTIFIER_BYTES,
         ),
+        replica=_replica(raw["replica"], "greenplum.replica"),
         external_table_name_template=_name_template(
             raw["external_table_name_template"],
             "greenplum.external_table_name_template",
@@ -484,7 +507,7 @@ def _load_greenplum(raw_value: object) -> GreenplumConfig:
 
 
 def load_config(path: Path, *, display_name: str) -> FactoryConfig:
-    """Read and strictly validate a version 2 YAML configuration file."""
+    """Read and strictly validate a version 3 YAML configuration file."""
     if not path.is_file():
         raise ConfigurationError(f"configuration file does not exist: {display_name}")
 
@@ -510,9 +533,10 @@ def load_config(path: Path, *, display_name: str) -> FactoryConfig:
 
     raw = _mapping(raw_value, "configuration")
     version = raw.get("version")
-    if type(version) is int and version == 1:
+    if type(version) is int and version in _LEGACY_CONFIG_VERSIONS:
         raise ConfigurationError(
-            "configuration version 1 is no longer supported; migrate to version 2"
+            f"configuration version {version} is no longer supported; "
+            f"migrate to version {_CONFIG_VERSION}"
         )
     allowed = frozenset({"version", "output", "hive", "greenplum"})
     _keys(
@@ -522,11 +546,12 @@ def load_config(path: Path, *, display_name: str) -> FactoryConfig:
         required=frozenset({"version"}),
     )
     version = raw["version"]
-    if type(version) is not int or version != 2:
-        raise ConfigurationError("configuration version must be 2")
+    if type(version) is not int or version != _CONFIG_VERSION:
+        raise ConfigurationError(f"configuration version must be {_CONFIG_VERSION}")
     _keys(raw, label="configuration", allowed=allowed)
 
     return FactoryConfig(
+        version=_CONFIG_VERSION,
         output=_load_output(raw["output"]),
         hive=_load_hive(raw["hive"]),
         greenplum=_load_greenplum(raw["greenplum"]),

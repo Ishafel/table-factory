@@ -142,7 +142,7 @@ def test_generate_does_not_clean_unrelated_existing_outputs(
 
 def test_generate_rejects_an_artifact_path_that_is_the_input_ddl(
     tmp_path: Path,
-    repository_config: Path,
+    test_config_path: Path,
 ) -> None:
     input_path = tmp_path / "db_t__01_hive_create_physical.sql"
     original = b"CREATE TABLE db.t (id BIGINT);\n"
@@ -155,7 +155,7 @@ def test_generate_rejects_an_artifact_path_that_is_the_input_ddl(
         "--output",
         tmp_path,
         "--config",
-        repository_config,
+        test_config_path,
         cwd=tmp_path,
         check=False,
     )
@@ -173,7 +173,7 @@ def test_generate_rejects_an_artifact_path_that_is_the_input_ddl(
 )
 def test_generate_rejects_a_destination_that_is_a_hard_link_to_input_ddl(
     tmp_path: Path,
-    repository_config: Path,
+    test_config_path: Path,
 ) -> None:
     input_directory = tmp_path / "input"
     output_directory = tmp_path / "output"
@@ -204,7 +204,7 @@ def test_generate_rejects_a_destination_that_is_a_hard_link_to_input_ddl(
         "--output",
         output_directory,
         "--config",
-        repository_config,
+        test_config_path,
         cwd=tmp_path,
         check=False,
     )
@@ -443,17 +443,23 @@ def test_inspect_returns_json_and_keeps_host_paths_private(
 
     document = parse_json_output(result)
     assert isinstance(document, dict)
-    assert document["config"]["version"] == 2
+    assert document["config"]["version"] == 3
+    assert document["config"]["hive"]["replica"] == "replica"
+    assert document["config"]["greenplum"]["replica"] == "replica"
     table = document["tables"][0]
     assert table["source_path"] == "входные DDL/пример таблицы.sql"
     assert table["qualified_name"] == "analytics.customer_orders"
     assert table["external"] is True
     assert [column["name"] for column in table["partition_columns"]] == ["business_date"]
-    assert table["targets"]["hive"]["qualified_name"] == ("target_hive_db.customer_orders_physical")
-    assert table["targets"]["greenplum"]["external"]["qualified_name"] == (
-        "ext.customer_orders_ext"
+    assert table["targets"]["hive"]["qualified_name"] == (
+        "target_hive_db.replica_customer_orders_physical"
     )
-    assert table["targets"]["greenplum"]["physical"]["qualified_name"] == ("dwh.customer_orders")
+    assert table["targets"]["greenplum"]["external"]["qualified_name"] == (
+        "ext.replica_customer_orders_ext"
+    )
+    assert table["targets"]["greenplum"]["physical"]["qualified_name"] == (
+        "dwh.replica_customer_orders"
+    )
     assert [column["greenplum_type"] for column in table["greenplum_columns"]] == [
         "BIGINT",
         "TEXT",
@@ -559,7 +565,7 @@ def test_hive_physical_artifact_replaces_source_storage_and_partitioning(
     create = next(cli_case["output"].glob("*__01_hive_create_physical.sql")).read_text(
         encoding="utf-8"
     )
-    assert "CREATE TABLE `target_hive_db`.`customer_orders_physical`" in create
+    assert "CREATE TABLE `target_hive_db`.`replica_customer_orders_physical`" in create
     assert "`business_date` DATE COMMENT 'Source partition date'" in create
     assert "STORED AS TEXTFILE" in create
     assert "FIELDS TERMINATED BY ','" in create
