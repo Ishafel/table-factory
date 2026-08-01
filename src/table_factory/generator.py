@@ -7,7 +7,7 @@ import re
 import secrets
 import stat
 import unicodedata
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
@@ -75,6 +75,18 @@ def _safe_comment_text(value: str) -> str:
     )
 
 
+def artifact_filenames(
+    table: Table | TablePlan,
+    *,
+    config: FactoryConfig,
+) -> tuple[str, ...]:
+    """Return every potential output name without invoking a renderer."""
+    source = table.source if isinstance(table, TablePlan) else table
+    stem = _safe_stem(source)
+    separator = config.filename_separator
+    return tuple(f"{stem}{separator}{role}.sql" for role in ARTIFACT_ROLES)
+
+
 def render_artifacts(
     table: Table | TablePlan,
     *,
@@ -115,30 +127,39 @@ def render_artifacts(
         lambda: header + render_greenplum_create_physical(plan, config=config),
         lambda: header + render_greenplum_insert(plan),
     )
-    stem = _safe_stem(plan.source)
-    separator = config.filename_separator
+    filenames = artifact_filenames(plan, config=config)
     return tuple(
         Artifact(
-            filename=f"{stem}{separator}{role}.sql",
+            filename=filename,
             content=renderer(),
         )
-        for role, renderer in zip(ARTIFACT_ROLES, renderers, strict=True)
+        for role, filename, renderer in zip(
+            ARTIFACT_ROLES,
+            filenames,
+            renderers,
+            strict=True,
+        )
         if config.output.artifact_enabled(role)
     )
 
 
-def ensure_unique_artifacts(artifacts: list[Artifact]) -> None:
-    """Reject inputs that would overwrite each other after safe-name normalization."""
+def ensure_unique_artifact_names(filenames: Iterable[str]) -> None:
+    """Reject potential outputs that collide after safe-name normalization."""
     names: set[str] = set()
     duplicates: set[str] = set()
-    for artifact in artifacts:
-        comparison_name = unicodedata.normalize("NFKC", artifact.filename).casefold()
+    for filename in filenames:
+        comparison_name = unicodedata.normalize("NFKC", filename).casefold()
         if comparison_name in names:
-            duplicates.add(artifact.filename)
+            duplicates.add(filename)
         names.add(comparison_name)
     if duplicates:
         duplicate_list = ", ".join(sorted(duplicates))
         raise TableFactoryError(f"multiple tables map to the same output name: {duplicate_list}")
+
+
+def ensure_unique_artifacts(artifacts: list[Artifact]) -> None:
+    """Reject rendered outputs that would overwrite each other."""
+    ensure_unique_artifact_names(artifact.filename for artifact in artifacts)
 
 
 def _destination_name(filename: str) -> str:

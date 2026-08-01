@@ -2,16 +2,19 @@
 
 from __future__ import annotations
 
+import os
 import re
+import stat
 import string
 from collections.abc import Hashable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import yaml
+from yaml.composer import ComposerError
 from yaml.constructor import ConstructorError
-from yaml.nodes import MappingNode
+from yaml.nodes import MappingNode, Node, ScalarNode
 
 from table_factory.errors import ConfigurationError
 
@@ -31,6 +34,11 @@ _LOCATION_PLACEHOLDERS = frozenset(
 _GREENPLUM_IDENTIFIER_BYTES = 63
 _CONFIG_VERSION = 3
 _LEGACY_CONFIG_VERSIONS = frozenset({1, 2})
+_MAX_CONFIG_BYTES = 1024 * 1024
+_MAX_YAML_DEPTH = 64
+_MAX_YAML_INTEGER_CHARACTERS = 128
+_YAML_INTEGER_TAG = "tag:yaml.org,2002:int"
+_YAML_TIMESTAMP_TAG = "tag:yaml.org,2002:timestamp"
 ARTIFACT_ROLES = (
     "01_hive_create_physical",
     "02_hive_insert",
@@ -44,6 +52,24 @@ _ALL_ARTIFACT_ROLES = frozenset(ARTIFACT_ROLES)
 
 class _UniqueKeySafeLoader(yaml.SafeLoader):
     """Safe YAML loader that rejects ambiguous duplicate mapping keys."""
+
+    def __init__(self, stream: Any) -> None:
+        self._compose_depth = 0
+        super().__init__(stream)
+
+    def compose_node(self, parent: Node | None, index: Any) -> Node:
+        self._compose_depth += 1
+        try:
+            if self._compose_depth > _MAX_YAML_DEPTH:
+                raise ComposerError(
+                    None,
+                    None,
+                    f"configuration nesting exceeds {_MAX_YAML_DEPTH} levels",
+                    parent.start_mark if parent is not None else None,
+                )
+            return cast(Node, super().compose_node(parent, index))
+        finally:
+            self._compose_depth -= 1
 
     def construct_mapping(
         self,
@@ -70,6 +96,35 @@ class _UniqueKeySafeLoader(yaml.SafeLoader):
                 )
             mapping[key] = self.construct_object(value_node, deep=deep)
         return mapping
+
+
+def _construct_bounded_yaml_integer(
+    loader: _UniqueKeySafeLoader,
+    node: ScalarNode,
+) -> int:
+    if len(node.value) > _MAX_YAML_INTEGER_CHARACTERS:
+        raise ConstructorError(
+            None,
+            None,
+            f"integer value exceeds {_MAX_YAML_INTEGER_CHARACTERS} characters",
+            node.start_mark,
+        )
+    value = yaml.SafeLoader.construct_yaml_int(loader, node)
+    if type(value) is not int:
+        raise ConstructorError(None, None, "invalid integer value", node.start_mark)
+    return value
+
+
+# SafeLoader's resolver tables are mutable class state. Copy them before removing
+# timestamp inference so this config-specific policy cannot affect other YAML users.
+_UniqueKeySafeLoader.yaml_implicit_resolvers = {
+    initial: [(tag, pattern) for tag, pattern in resolvers if tag != _YAML_TIMESTAMP_TAG]
+    for initial, resolvers in yaml.SafeLoader.yaml_implicit_resolvers.items()
+}
+_UniqueKeySafeLoader.add_constructor(
+    _YAML_INTEGER_TAG,
+    _construct_bounded_yaml_integer,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -614,20 +669,62 @@ def _load_greenplum(raw_value: object) -> GreenplumConfig:
     )
 
 
-def load_config(path: Path, *, display_name: str) -> FactoryConfig:
-    """Read and strictly validate a version 3 YAML configuration file."""
-    if not path.is_file():
-        raise ConfigurationError(f"configuration file does not exist: {display_name}")
+def _safe_display_name(display_name: str) -> str:
+    candidate = Path(display_name)
+    label = candidate.name if candidate.is_absolute() else candidate.as_posix()
+    if not label:
+        label = "."
+    return "".join(
+        character
+        if character.isprintable() and character not in "\r\n"
+        else f"\\u{ord(character):04x}"
+        for character in label
+    )
 
+
+def _read_config(path: Path, *, display_name: str) -> str:
     try:
-        contents = path.read_text(encoding="utf-8")
+        flags = (
+            os.O_RDONLY
+            | getattr(os, "O_BINARY", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NONBLOCK", 0)
+        )
+        descriptor = os.open(path, flags)
+        try:
+            if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                raise ConfigurationError(f"configuration file does not exist: {display_name}")
+            with os.fdopen(descriptor, "rb", closefd=False) as handle:
+                encoded = handle.read(_MAX_CONFIG_BYTES + 1)
+        finally:
+            os.close(descriptor)
+    except FileNotFoundError:
+        raise ConfigurationError(f"configuration file does not exist: {display_name}") from None
     except OSError as error:
         detail = error.strerror or "I/O error"
         raise ConfigurationError(f"cannot read configuration {display_name}: {detail}") from None
+    except ValueError:
+        raise ConfigurationError(
+            f"cannot read configuration {display_name}: invalid path"
+        ) from None
+
+    if len(encoded) > _MAX_CONFIG_BYTES:
+        raise ConfigurationError(
+            f"cannot read configuration {display_name}: file exceeds {_MAX_CONFIG_BYTES} bytes"
+        )
+
+    try:
+        return encoded.decode("utf-8")
     except UnicodeError:
         raise ConfigurationError(
             f"cannot read configuration {display_name}: invalid UTF-8"
         ) from None
+
+
+def load_config(path: Path, *, display_name: str) -> FactoryConfig:
+    """Read and strictly validate a version 3 YAML configuration file."""
+    safe_display_name = _safe_display_name(display_name)
+    contents = _read_config(path, display_name=safe_display_name)
 
     try:
         raw_value = yaml.load(contents, Loader=_UniqueKeySafeLoader)
@@ -636,7 +733,11 @@ def load_config(path: Path, *, display_name: str) -> FactoryConfig:
         mark = getattr(error, "problem_mark", None)
         location = f" at line {mark.line + 1}, column {mark.column + 1}" if mark is not None else ""
         raise ConfigurationError(
-            f"cannot read configuration {display_name}: {problem}{location}"
+            f"cannot read configuration {safe_display_name}: {problem}{location}"
+        ) from None
+    except (ValueError, OverflowError, RecursionError):
+        raise ConfigurationError(
+            f"cannot read configuration {safe_display_name}: invalid YAML value"
         ) from None
 
     raw = _mapping(raw_value, "configuration")

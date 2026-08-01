@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import stat
 import sys
 from collections.abc import Sequence
 from pathlib import Path
@@ -80,7 +81,18 @@ def _run(arguments: argparse.Namespace, *, cwd: Path) -> int:
 
     if arguments.command == "inspect":
         ddl_path = resolve_from_cwd(arguments.ddl_path, cwd=cwd)
-        if not ddl_path.is_file():
+        try:
+            ddl_status = ddl_path.stat()
+        except FileNotFoundError:
+            raise TableFactoryError("inspect requires one SQL file") from None
+        except OSError as error:
+            label = display_path(ddl_path, cwd=cwd)
+            detail = error.strerror or "I/O error"
+            raise TableFactoryError(f"cannot inspect input {label}: {detail}") from None
+        except ValueError:
+            label = display_path(ddl_path, cwd=cwd)
+            raise TableFactoryError(f"cannot inspect input {label}: invalid path") from None
+        if not stat.S_ISREG(ddl_status.st_mode):
             raise TableFactoryError("inspect requires one SQL file")
         prepared = prepare(ddl_path, config=config, cwd=cwd)
         payload = {

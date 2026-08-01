@@ -12,6 +12,5 @@ services:
       - type: bind
         source: .
         target: /workspace
-    user: "${LOCAL_UID:-1000}:${LOCAL_GID:-1000}"
     entrypoint:
       - table-factory

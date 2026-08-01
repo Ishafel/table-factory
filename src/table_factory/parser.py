@@ -68,6 +68,8 @@ _TABLE_CLAUSE_ORDER = {
     "LOCATION": 6,
     "TBLPROPERTIES": 7,
 }
+_MAX_TYPE_PARAMETER_DIGITS = 32
+_MAX_TYPE_NESTING = 100
 
 
 def _without_comments(sql: str) -> str:
@@ -842,7 +844,7 @@ class _TypeParser:
         self.index = 0
 
     def parse(self) -> None:
-        self._type()
+        self._type(depth=0)
         self._whitespace()
         if self.index != len(self.value):
             raise DdlParseError("unsupported or malformed Hive data type")
@@ -872,11 +874,14 @@ class _TypeParser:
 
     def _integer(self) -> int:
         self._whitespace()
-        match = re.match(r"\d+", self.value[self.index :])
+        match = re.match(r"[0-9]+", self.value[self.index :])
         if match is None:
             raise DdlParseError("expected an integer type parameter")
-        self.index += len(match.group(0))
-        return int(match.group(0))
+        token = match.group(0)
+        self.index += len(token)
+        if len(token) > _MAX_TYPE_PARAMETER_DIGITS:
+            raise DdlParseError("Hive integer type parameter exceeds the supported length")
+        return int(token)
 
     def _field_name(self) -> None:
         self._whitespace()
@@ -912,13 +917,17 @@ class _TypeParser:
             return
         self.index = _quoted_literal_end(self.value, self.index)
 
-    def _type_list(self) -> None:
-        self._type()
+    def _type_list(self, *, depth: int) -> None:
+        self._type(depth=depth)
         while self._consume(","):
-            self._type()
+            self._type(depth=depth)
 
-    def _type(self) -> bool:
+    def _type(self, *, depth: int) -> bool:
         """Parse one type and report whether it is primitive."""
+        if depth > _MAX_TYPE_NESTING:
+            raise DdlParseError(
+                f"Hive data type nesting exceeds the supported limit of {_MAX_TYPE_NESTING}"
+            )
         name = self._word()
         if name in _SIMPLE_TYPES:
             if name == "TIMESTAMP" and self._remaining_words("WITH", "LOCAL", "TIME", "ZONE"):
@@ -947,32 +956,32 @@ class _TypeParser:
             return True
         if name == "ARRAY":
             self._expect("<")
-            self._type()
+            self._type(depth=depth + 1)
             self._expect(">")
             return False
         if name == "MAP":
             self._expect("<")
-            if not self._type():
+            if not self._type(depth=depth + 1):
                 raise DdlParseError("MAP keys must use a primitive Hive type")
             self._expect(",")
-            self._type()
+            self._type(depth=depth + 1)
             self._expect(">")
             return False
         if name == "UNIONTYPE":
             self._expect("<")
-            self._type_list()
+            self._type_list(depth=depth + 1)
             self._expect(">")
             return False
         if name == "STRUCT":
             self._expect("<")
             self._field_name()
             self._expect(":")
-            self._type()
+            self._type(depth=depth + 1)
             self._optional_comment()
             while self._consume(","):
                 self._field_name()
                 self._expect(":")
-                self._type()
+                self._type(depth=depth + 1)
                 self._optional_comment()
             self._expect(">")
             return False

@@ -30,6 +30,10 @@ class SecurePathUnsupportedError(PathSafetyError):
     """The host cannot provide the descriptor-relative operations we require."""
 
 
+class PathInspectionError(PathSafetyError):
+    """Filesystem metadata could not be inspected without exposing a host path."""
+
+
 @dataclass(frozen=True, slots=True)
 class FileIdentity:
     """Stable filesystem identity captured from an open descriptor."""
@@ -42,13 +46,20 @@ class FileIdentity:
         return cls(device=status.st_dev, inode=status.st_ino)
 
 
-def _is_trusted_system_symlink(path: Path) -> bool:
+def _inspection_error(error: OSError | ValueError) -> PathInspectionError:
+    detail = (error.strerror or "I/O error") if isinstance(error, OSError) else "invalid path"
+    return PathInspectionError(f"cannot inspect path component: {detail}")
+
+
+def _is_trusted_system_symlink(
+    path: Path,
+    link_status: os.stat_result,
+) -> bool:
     """Allow stable root-owned aliases such as macOS ``/var`` and ``/tmp``."""
     try:
-        link_status = path.lstat()
         parent_status = path.parent.stat()
-    except OSError:
-        return False
+    except (OSError, ValueError) as error:
+        raise _inspection_error(error) from None
     writable_by_non_root = parent_status.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
     return (
         stat.S_ISLNK(link_status.st_mode)
@@ -64,7 +75,16 @@ def has_untrusted_symlink_component(path: Path) -> bool:
     current = Path(absolute.anchor)
     for component in absolute.parts[1:]:
         current /= component
-        if current.is_symlink() and not _is_trusted_system_symlink(current):
+        try:
+            link_status = current.lstat()
+        except FileNotFoundError:
+            return False
+        except (OSError, ValueError) as error:
+            raise _inspection_error(error) from None
+        if stat.S_ISLNK(link_status.st_mode) and not _is_trusted_system_symlink(
+            current,
+            link_status,
+        ):
             return True
     return False
 

@@ -76,6 +76,11 @@ def test_compose_defines_one_transient_bind_mounted_service() -> None:
     assert build.get("target") == "development"
     assert service.get("working_dir") == "/workspace"
     assert _entrypoint_tokens(service.get("entrypoint")) == ["table-factory"]
+    assert "user" not in service, "Compose must not override the image's non-root USER"
+    assert build.get("args") == {
+        "APP_UID": "${LOCAL_UID:-1000}",
+        "APP_GID": "${LOCAL_GID:-1000}",
+    }
 
     volumes = service.get("volumes")
     assert isinstance(volumes, list)
@@ -125,6 +130,12 @@ def test_dockerfile_is_python_312_multistage_with_editable_dev_install() -> None
         r"-e\s+[\"']?\.\[dev\][\"']?",
         logical_lines,
         flags=re.IGNORECASE,
+    )
+    assert "APP_UID and APP_GID must be non-zero" in text
+    assert re.search(
+        r"^\s*USER\s+\$\{APP_UID\}:\$\{APP_GID\}\s*$",
+        text,
+        flags=re.MULTILINE,
     )
 
 

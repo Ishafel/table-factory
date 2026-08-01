@@ -9,6 +9,7 @@ from table_factory.errors import SemanticValidationError
 from table_factory.models import Table, TargetNames
 
 _GREENPLUM_IDENTIFIER_BYTES = 63
+_UNSAFE_IDENTIFIER_CATEGORIES = frozenset({"Cc", "Cf", "Zl", "Zp"})
 
 
 def _comparison(value: str) -> str:
@@ -81,7 +82,9 @@ def _validate_column_names(table: Table) -> None:
 
 
 def _contains_control(value: str) -> bool:
-    return any(ord(character) < 32 or ord(character) == 127 for character in value)
+    return any(
+        unicodedata.category(character) in _UNSAFE_IDENTIFIER_CATEGORIES for character in value
+    )
 
 
 def _validate_source_values(table: Table) -> None:
@@ -91,7 +94,8 @@ def _validate_source_values(table: Table) -> None:
     ]
     if any(_contains_control(identifier) for identifier in identifiers):
         raise SemanticValidationError(
-            f"source table {table.qualified_name} contains a control character in an identifier"
+            "source table contains a control character, Unicode format character, "
+            "or Unicode line or paragraph separator in an identifier"
         )
     comments = [
         *(value for value in (table.comment,) if value is not None),

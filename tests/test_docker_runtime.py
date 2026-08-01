@@ -7,7 +7,7 @@ import shutil
 import subprocess
 import sys
 import uuid
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from pathlib import Path
 
 import pytest
@@ -36,12 +36,16 @@ def _compose(
     *arguments: str,
     check: bool = True,
     timeout: int = 600,
+    environment_overrides: Mapping[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     command = ["docker", "compose", *arguments]
+    environment = _docker_environment()
+    if environment_overrides is not None:
+        environment.update(environment_overrides)
     result = subprocess.run(
         command,
         cwd=PROJECT_ROOT,
-        env=_docker_environment(),
+        env=environment,
         text=True,
         capture_output=True,
         check=False,
@@ -150,6 +154,30 @@ def test_development_package_is_editable_and_container_is_non_root() -> None:
         "-u",
     )
     assert int(uid.stdout.strip()) != 0
+
+
+def test_root_host_ids_cannot_override_the_image_user_or_build_a_root_image() -> None:
+    root_environment = {"LOCAL_UID": "0", "LOCAL_GID": "0"}
+    uid = _compose(
+        "run",
+        "--rm",
+        "--entrypoint",
+        "id",
+        "table-factory",
+        "-u",
+        environment_overrides=root_environment,
+    )
+    assert int(uid.stdout.strip()) != 0
+
+    rejected_build = _compose(
+        "build",
+        "table-factory",
+        check=False,
+        timeout=1_200,
+        environment_overrides=root_environment,
+    )
+    assert rejected_build.returncode != 0
+    assert "APP_UID and APP_GID must be non-zero" in (rejected_build.stdout + rejected_build.stderr)
 
 
 def test_documented_quality_commands_run_inside_the_container() -> None:

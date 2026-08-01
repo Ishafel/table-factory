@@ -13,6 +13,8 @@ from table_factory.config import FactoryConfig
 from table_factory.errors import DdlParseError, TableFactoryError
 from table_factory.generator import (
     Artifact,
+    artifact_filenames,
+    ensure_unique_artifact_names,
     ensure_unique_artifacts,
     render_artifacts,
     write_artifacts,
@@ -375,6 +377,9 @@ def prepare(
             )
     plans = tuple(planned)
     _ensure_unique_targets(plans)
+    ensure_unique_artifact_names(
+        filename for plan in plans for filename in artifact_filenames(plan, config=config)
+    )
 
     rendered: list[Artifact] = []
     for plan in plans:

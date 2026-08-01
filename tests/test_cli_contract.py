@@ -12,7 +12,7 @@ import table_factory.workflow as workflow_module
 from table_factory.config import ARTIFACT_ROLES
 from table_factory.errors import OutputSafetyError, TableFactoryError
 from table_factory.generator import Artifact, write_artifacts
-from table_factory.path_safety import has_untrusted_symlink_component
+from table_factory.path_safety import PathInspectionError, has_untrusted_symlink_component
 from table_factory.workflow import display_path
 
 
@@ -72,6 +72,182 @@ def test_root_owned_system_path_aliases_are_not_treated_as_user_symlinks() -> No
     aliases = [path for path in (Path("/var"), Path("/tmp")) if path.is_symlink()]
     if aliases:
         assert all(not has_untrusted_symlink_component(path / "folders") for path in aliases)
+
+
+def test_symlink_component_probe_normalizes_os_errors_without_host_paths(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requested = tmp_path / "restricted" / "input.sql"
+
+    def fail_to_inspect(path: Path) -> os.stat_result:
+        raise PermissionError(13, "Permission denied", str(path))
+
+    monkeypatch.setattr(Path, "lstat", fail_to_inspect)
+
+    with pytest.raises(PathInspectionError) as captured:
+        has_untrusted_symlink_component(requested)
+
+    assert str(captured.value) == "cannot inspect path component: Permission denied"
+    _assert_no_absolute_workspace_path(str(captured.value), tmp_path)
+
+
+@pytest.mark.parametrize(
+    "probe",
+    ["input", "config", "output", "inspect"],
+)
+def test_cli_normalizes_overlong_path_components(
+    cli_case: dict[str, Path],
+    probe: str,
+) -> None:
+    root = cli_case["root"]
+    overlong_component = "x" * 300
+    config_label = _relative(cli_case["config"], root)
+    input_label = _relative(cli_case["input"], root)
+
+    if probe == "input":
+        arguments = (
+            "validate",
+            "--input",
+            overlong_component,
+            "--config",
+            config_label,
+        )
+    elif probe == "config":
+        arguments = (
+            "validate",
+            "--input",
+            input_label,
+            "--config",
+            overlong_component,
+        )
+    elif probe == "output":
+        arguments = (
+            "generate",
+            "--input",
+            input_label,
+            "--output",
+            overlong_component,
+            "--config",
+            config_label,
+        )
+    else:
+        arguments = (
+            "inspect",
+            overlong_component,
+            "--config",
+            config_label,
+        )
+
+    result = invoke_cli(*arguments, cwd=root, check=False)
+
+    assert result.returncode == 2
+    assert "Traceback" not in result.stderr
+    _assert_no_absolute_workspace_path(result.stdout + result.stderr, root)
+
+
+@pytest.mark.parametrize(
+    "probe",
+    ["input", "config", "output", "inspect"],
+)
+def test_cli_normalizes_paths_below_an_inaccessible_directory(
+    cli_case: dict[str, Path],
+    probe: str,
+) -> None:
+    root = cli_case["root"]
+    restricted = root / "restricted"
+    restricted.mkdir()
+    restricted_sql = restricted / "source.sql"
+    restricted_sql.write_text("CREATE TABLE db.t (id BIGINT);\n", encoding="utf-8")
+    restricted_config = restricted / "config.yaml"
+    restricted_config.write_bytes(cli_case["config"].read_bytes())
+    config_label = _relative(cli_case["config"], root)
+    input_label = _relative(cli_case["input"], root)
+
+    if probe == "input":
+        arguments = (
+            "validate",
+            "--input",
+            _relative(restricted_sql, root),
+            "--config",
+            config_label,
+        )
+    elif probe == "config":
+        arguments = (
+            "validate",
+            "--input",
+            input_label,
+            "--config",
+            _relative(restricted_config, root),
+        )
+    elif probe == "output":
+        arguments = (
+            "generate",
+            "--input",
+            input_label,
+            "--output",
+            _relative(restricted / "output", root),
+            "--config",
+            config_label,
+        )
+    else:
+        arguments = (
+            "inspect",
+            _relative(restricted_sql, root),
+            "--config",
+            config_label,
+        )
+
+    restricted.chmod(0)
+    try:
+        try:
+            next(restricted.iterdir())
+        except PermissionError:
+            pass
+        else:
+            pytest.skip("The current user can read directories without permission bits")
+        result = invoke_cli(*arguments, cwd=root, check=False)
+    finally:
+        restricted.chmod(0o700)
+
+    assert result.returncode == 2
+    assert "Traceback" not in result.stderr
+    _assert_no_absolute_workspace_path(result.stdout + result.stderr, root)
+
+
+@pytest.mark.parametrize(
+    "malformed_value",
+    ["timestamp", "integer", "nesting"],
+)
+def test_cli_normalizes_yaml_constructor_and_nesting_failures(
+    cli_case: dict[str, Path],
+    malformed_value: str,
+) -> None:
+    root = cli_case["root"]
+    config = cli_case["config"]
+    contents = config.read_text(encoding="utf-8")
+    if malformed_value == "timestamp":
+        contents += "\nunexpected: !!timestamp 2023-02-30\n"
+    elif malformed_value == "integer":
+        contents = contents.replace("version: 3", f"version: {'9' * 5000}", 1)
+    else:
+        nested_value = "[" * 1500 + "0" + "]" * 1500
+        contents += f"\nunexpected: {nested_value}\n"
+    config.write_text(contents, encoding="utf-8")
+
+    result = invoke_cli(
+        "validate",
+        "--input",
+        _relative(cli_case["input"], root),
+        "--config",
+        _relative(config, root),
+        cwd=root,
+        check=False,
+    )
+
+    assert result.returncode == 2
+    assert "Traceback" not in result.stderr
+    _assert_no_absolute_workspace_path(result.stdout + result.stderr, root)
 
 
 def test_generate_resolves_relative_unicode_paths_and_writes_six_files(
@@ -221,6 +397,47 @@ def test_generate_allows_every_artifact_to_be_disabled(
     assert "Generated 0 SQL files" in result.stdout
     assert cli_case["output"].is_dir()
     assert not list(cli_case["output"].iterdir())
+
+
+def test_all_disabled_artifacts_still_reject_output_filename_collisions(
+    cli_case: dict[str, Path],
+) -> None:
+    root = cli_case["root"]
+    cli_case["ddl"].write_text(
+        "CREATE TABLE a.b_c (id BIGINT);\nCREATE TABLE a_b.c (id BIGINT);\n",
+        encoding="utf-8",
+    )
+    _configure_artifacts(cli_case["config"], set())
+
+    commands = (
+        (
+            "generate",
+            "--input",
+            _relative(cli_case["input"], root),
+            "--output",
+            _relative(cli_case["output"], root),
+            "--config",
+            _relative(cli_case["config"], root),
+        ),
+        (
+            "validate",
+            "--input",
+            _relative(cli_case["input"], root),
+            "--config",
+            _relative(cli_case["config"], root),
+        ),
+    )
+
+    for command in commands:
+        result = invoke_cli(*command, cwd=root, check=False)
+
+        assert result.returncode == 2
+        assert "multiple tables map to the same output name" in result.stderr
+        assert "a_b_c__01_hive_create_physical.sql" in result.stderr
+        assert "Traceback" not in result.stderr
+        _assert_no_absolute_workspace_path(result.stdout + result.stderr, root)
+
+    assert not cli_case["output"].exists()
 
 
 def test_generate_and_inspect_support_qualified_name_inside_one_backtick_pair(
@@ -660,6 +877,58 @@ def test_invalid_ddl_fails_without_partial_outputs(
     assert result.returncode != 0
     assert not cli_case["output"].exists() or not list(cli_case["output"].rglob("*.sql"))
     _assert_no_absolute_workspace_path(result.stdout + result.stderr, root)
+
+
+@pytest.mark.parametrize(
+    ("ddl_text", "expected_error", "unsafe_character"),
+    (
+        pytest.param(
+            f"CREATE TABLE source_db.events (value VARCHAR({'9' * 5_000}));\n",
+            "Hive integer type parameter exceeds the supported length",
+            None,
+            id="oversized-type-parameter",
+        ),
+        pytest.param(
+            f"CREATE TABLE source_db.events (value {'ARRAY<' * 1_500}INT{'>' * 1_500});\n",
+            "Hive data type nesting exceeds the supported limit of 100",
+            None,
+            id="excessive-type-nesting",
+        ),
+        pytest.param(
+            "CREATE TABLE source_db.events (`a\u0085b` STRING);\n",
+            "contains a control character",
+            "\u0085",
+            id="unicode-c1-control",
+        ),
+    ),
+)
+def test_cli_reports_adversarial_ddl_as_safe_domain_errors(
+    cli_case: dict[str, Path],
+    ddl_text: str,
+    expected_error: str,
+    unsafe_character: str | None,
+) -> None:
+    root = cli_case["root"]
+    cli_case["ddl"].write_text(ddl_text, encoding="utf-8")
+
+    result = invoke_cli(
+        "validate",
+        "--input",
+        _relative(cli_case["input"], root),
+        "--config",
+        _relative(cli_case["config"], root),
+        cwd=root,
+        check=False,
+    )
+
+    observable_text = result.stdout + result.stderr
+    assert result.returncode == 2
+    assert result.stderr.startswith("table-factory: error: ")
+    assert expected_error in result.stderr
+    assert "Traceback" not in observable_text
+    if unsafe_character is not None:
+        assert unsafe_character not in observable_text
+    _assert_no_absolute_workspace_path(observable_text, root)
 
 
 def test_table_name_cannot_escape_the_output_directory(

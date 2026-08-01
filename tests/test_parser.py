@@ -5,7 +5,7 @@ from dataclasses import replace
 import pytest
 
 from table_factory.config import FactoryConfig
-from table_factory.errors import DdlParseError, TableFactoryError
+from table_factory.errors import DdlParseError, SemanticValidationError, TableFactoryError
 from table_factory.generator import ensure_unique_artifacts, render_artifacts
 from table_factory.parser import parse_hive_ddl
 from table_factory.sql import hive_string
@@ -145,6 +145,28 @@ def test_malformed_hive_types_are_rejected(data_type: str) -> None:
         parse_hive_ddl(f"CREATE TABLE broken (value {data_type});")
 
 
+def test_oversized_hive_type_parameter_is_a_domain_error() -> None:
+    data_type = f"VARCHAR({'9' * 5_000})"
+
+    with pytest.raises(DdlParseError, match="integer type parameter exceeds"):
+        parse_hive_ddl(f"CREATE TABLE broken (value {data_type});")
+
+
+def test_excessively_nested_hive_type_is_a_domain_error() -> None:
+    data_type = f"{'ARRAY<' * 1_500}INT{'>' * 1_500}"
+
+    with pytest.raises(DdlParseError, match="nesting exceeds the supported limit"):
+        parse_hive_ddl(f"CREATE TABLE broken (value {data_type});")
+
+
+def test_hive_type_nesting_at_supported_limit_is_accepted() -> None:
+    data_type = f"{'ARRAY<' * 100}INT{'>' * 100}"
+
+    table = parse_hive_ddl(f"CREATE TABLE nested (value {data_type});")[0]
+
+    assert table.columns[0].data_type == data_type
+
+
 @pytest.mark.parametrize(
     "columns",
     (
@@ -169,6 +191,33 @@ def test_nested_hive_types_are_accepted() -> None:
     )[0]
 
     assert [column.name for column in table.columns] == ["attributes", "payload"]
+
+
+@pytest.mark.parametrize(
+    "unsafe_character",
+    (
+        "\u0085",  # Cc: NEXT LINE
+        "\u202e",  # Cf: RIGHT-TO-LEFT OVERRIDE
+        "\u2028",  # Zl: LINE SEPARATOR
+        "\u2029",  # Zp: PARAGRAPH SEPARATOR
+    ),
+)
+def test_unsafe_unicode_identifier_characters_are_rejected_without_echo(
+    unsafe_character: str,
+) -> None:
+    table = parse_hive_ddl(f"CREATE TABLE source_db.events (`a{unsafe_character}b` STRING);")[0]
+
+    with pytest.raises(
+        SemanticValidationError,
+        match="contains a control character",
+    ) as raised:
+        render_artifacts(
+            table,
+            config=FactoryConfig(),
+            source_label="unsafe.sql",
+        )
+
+    assert unsafe_character not in str(raised.value)
 
 
 def test_hive_comments_and_column_constraints_are_accepted() -> None:

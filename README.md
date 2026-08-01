@@ -79,7 +79,9 @@ docker compose run --rm table-factory generate \
 остаётся на хосте после завершения одноразового контейнера. Экспорт
 `LOCAL_UID`/`LOCAL_GID` нужен на Unix-хостах, чтобы build и последующие
 `docker compose run` использовали владельца bind-mounted файлов. Если
-переменные не заданы, Compose использует `1000:1000`.
+переменные не заданы, Compose использует `1000:1000`. Нулевые UID/GID
+отклоняются при сборке: root-driven CI должен явно выбрать ненулевой remap,
+поскольку development image никогда не запускает CLI от root.
 
 Первичная сборка может обращаться к registry базового image и Python package
 index, если нужных слоёв и пакетов ещё нет в cache. Уже собранный CLI выполняет
@@ -192,7 +194,8 @@ database. Для однозначной цепочки предпочтител�
 - пустой список колонок;
 - double-quoted identifiers и unquoted identifiers вне ASCII-грамматики
   `[A-Za-z_][A-Za-z0-9_]*`; произвольные имена нужно заключать в backticks;
-- управляющие символы в source database/table/column identifiers и NUL в
+- Unicode control (`Cc`), format (`Cf`), line separator (`Zl`) и paragraph
+  separator (`Zp`) символы в source database/table/column identifiers и NUL в
   table/column comments;
 - повторные column names среди общего списка обычных и partition columns после
   Unicode NFKC normalization и сравнения без учёта регистра;
@@ -427,7 +430,9 @@ Mapping явный, регистронезависимый и fail-closed:
 
 Hive `DECIMAL`/`NUMERIC` precision ограничен диапазоном `1..38`, scale не
 может превышать precision. `CHAR` допускает длину `1..255`, `VARCHAR` —
-`1..65535`.
+`1..65535`. Numeric type parameter ограничен 32 ASCII-цифрами до преобразования
+в число, а вложенность complex types — 100 уровнями; превышение обоих лимитов
+считается malformed DDL.
 
 Не поддерживаются и не преобразуются молча в `TEXT`:
 
@@ -477,6 +482,12 @@ source storage разбирается, но не копируется.
 Автоматического поиска config нет. Все показанные ниже поля обязательны, кроме
 необязательной partial mapping `output.artifacts`; неизвестные, отсутствующие
 обязательные и повторяющиеся mapping keys на любом уровне отклоняются.
+
+Загрузка YAML ограничена размером `1 MiB`, глубиной `64` уровня и `128`
+символами в representation одного integer. Неявное распознавание YAML
+date/timestamp отключено: такие plain scalars обрабатываются как строки и затем
+проходят обычную проверку schema. Ошибки YAML constructors нормализуются в
+безопасную CLI-диагностику без traceback и абсолютного host path.
 
 [`config/table-factory.yaml`](config/table-factory.yaml) — пользовательский
 runtime-конфиг и пример для локального запуска. Его можно менять под конкретное

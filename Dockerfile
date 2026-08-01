@@ -15,6 +15,16 @@ ARG APP_UID=1000
 ARG APP_GID=1000
 
 RUN set -eux; \
+    case "${APP_UID}" in \
+        ""|*[!0-9]*) echo "APP_UID must be a positive integer" >&2; exit 64 ;; \
+    esac; \
+    case "${APP_GID}" in \
+        ""|*[!0-9]*) echo "APP_GID must be a positive integer" >&2; exit 64 ;; \
+    esac; \
+    if [ "${APP_UID}" -eq 0 ] || [ "${APP_GID}" -eq 0 ]; then \
+        echo "APP_UID and APP_GID must be non-zero; refusing a root runtime" >&2; \
+        exit 64; \
+    fi; \
     if ! getent group "${APP_GID}" >/dev/null; then \
         groupadd --gid "${APP_GID}" developer; \
     fi; \
