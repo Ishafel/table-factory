@@ -72,6 +72,23 @@ _MAX_TYPE_PARAMETER_DIGITS = 32
 _MAX_TYPE_NESTING = 100
 
 
+def _quoted_scan_step(
+    value: str,
+    index: int,
+    quote: str,
+) -> tuple[int, str | None]:
+    """Advance inside one SQL quote and return the remaining quote state."""
+    character = value[index]
+    next_character = value[index + 1] if index + 1 < len(value) else ""
+    if character == quote:
+        if next_character == quote:
+            return index + 2, quote
+        return index + 1, None
+    if quote in {"'", '"'} and character == "\\" and next_character:
+        return index + 2, quote
+    return index + 1, quote
+
+
 def _without_comments(sql: str) -> str:
     """Mask SQL comments without changing offsets into the original document."""
     result = list(sql)
@@ -79,24 +96,15 @@ def _without_comments(sql: str) -> str:
     quote: str | None = None
     while index < len(sql):
         character = sql[index]
-        next_character = sql[index + 1] if index + 1 < len(sql) else ""
-
         if quote is not None:
-            if character == quote:
-                if next_character == quote and quote in {"'", '"', "`"}:
-                    index += 2
-                    continue
-                quote = None
-            elif character == "\\" and next_character:
-                index += 2
-                continue
-            index += 1
+            index, quote = _quoted_scan_step(sql, index, quote)
             continue
 
         if character in {"'", '"', "`"}:
             quote = character
             index += 1
             continue
+        next_character = sql[index + 1] if index + 1 < len(sql) else ""
         if character == "-" and next_character == "-":
             result[index] = " "
             result[index + 1] = " "
@@ -122,23 +130,20 @@ def _without_comments(sql: str) -> str:
     return "".join(result)
 
 
-def _closing_parenthesis(sql: str, opening: int) -> int:
+def _matching_parenthesis_end(
+    value: str,
+    opening: int,
+    *,
+    label: str,
+) -> int:
+    """Return the exclusive end of a quote-aware parenthesized expression."""
     depth = 0
     quote: str | None = None
     index = opening
-    while index < len(sql):
-        character = sql[index]
-        next_character = sql[index + 1] if index + 1 < len(sql) else ""
+    while index < len(value):
+        character = value[index]
         if quote is not None:
-            if character == quote:
-                if next_character == quote:
-                    index += 2
-                    continue
-                quote = None
-            elif character == "\\" and next_character:
-                index += 2
-                continue
-            index += 1
+            index, quote = _quoted_scan_step(value, index, quote)
             continue
         if character in {"'", '"', "`"}:
             quote = character
@@ -147,9 +152,20 @@ def _closing_parenthesis(sql: str, opening: int) -> int:
         elif character == ")":
             depth -= 1
             if depth == 0:
-                return index
+                return index + 1
         index += 1
-    raise DdlParseError("unclosed CREATE TABLE column list")
+    raise DdlParseError(f"unclosed {label}")
+
+
+def _closing_parenthesis(sql: str, opening: int) -> int:
+    return (
+        _matching_parenthesis_end(
+            sql,
+            opening,
+            label="CREATE TABLE column list",
+        )
+        - 1
+    )
 
 
 def _quoted_character_mask(sql: str) -> list[bool]:
@@ -159,20 +175,13 @@ def _quoted_character_mask(sql: str) -> list[bool]:
     quote: str | None = None
     while index < len(sql):
         character = sql[index]
-        next_character = sql[index + 1] if index + 1 < len(sql) else ""
         if quote is not None:
-            quoted[index] = True
-            if character == quote:
-                if next_character == quote:
-                    quoted[index + 1] = True
-                    index += 2
-                    continue
-                quote = None
-            elif character == "\\" and next_character:
-                quoted[index + 1] = True
-                index += 2
-                continue
-        elif character in {"'", '"', "`"}:
+            starting_index = index
+            index, quote = _quoted_scan_step(sql, index, quote)
+            for quoted_index in range(starting_index, index):
+                quoted[quoted_index] = True
+            continue
+        if character in {"'", '"', "`"}:
             quoted[index] = True
             quote = character
         index += 1
@@ -187,17 +196,10 @@ def _top_level_parts(value: str, *, delimiter: str = ",") -> Iterator[str]:
     index = 0
     while index < len(value):
         character = value[index]
-        next_character = value[index + 1] if index + 1 < len(value) else ""
         if quote is not None:
-            if character == quote:
-                if next_character == quote:
-                    index += 2
-                    continue
-                quote = None
-            elif character == "\\" and next_character:
-                index += 2
-                continue
-        elif character in {"'", '"', "`"}:
+            index, quote = _quoted_scan_step(value, index, quote)
+            continue
+        if character in {"'", '"', "`"}:
             quote = character
         elif character == "(":
             round_depth += 1
@@ -218,7 +220,11 @@ def _top_level_parts(value: str, *, delimiter: str = ",") -> Iterator[str]:
     yield value[start:]
 
 
-def _split_column_clauses(type_and_comment: str) -> tuple[str, str | None]:
+def _split_column_clauses(
+    type_and_comment: str,
+    *,
+    allow_constraints: bool = True,
+) -> tuple[str, str | None]:
     """Separate a Hive type from supported top-level column clauses."""
     round_depth = 0
     angle_depth = 0
@@ -226,17 +232,8 @@ def _split_column_clauses(type_and_comment: str) -> tuple[str, str | None]:
     index = 0
     while index < len(type_and_comment):
         character = type_and_comment[index]
-        next_character = type_and_comment[index + 1] if index + 1 < len(type_and_comment) else ""
         if quote is not None:
-            if character == quote:
-                if next_character == quote:
-                    index += 2
-                    continue
-                quote = None
-            elif character == "\\" and next_character:
-                index += 2
-                continue
-            index += 1
+            index, quote = _quoted_scan_step(type_and_comment, index, quote)
             continue
         if character in {"'", '"', "`"}:
             quote = character
@@ -259,7 +256,10 @@ def _split_column_clauses(type_and_comment: str) -> tuple[str, str | None]:
                 clauses = type_and_comment[index:].strip()
                 return (
                     type_and_comment[:index].strip(),
-                    _parse_column_clauses(clauses),
+                    _parse_column_clauses(
+                        clauses,
+                        allow_constraints=allow_constraints,
+                    ),
                 )
         index += 1
     return type_and_comment.strip(), None
@@ -274,17 +274,9 @@ def _quoted_literal_end(value: str, start: int = 0) -> int:
     quote = value[index]
     index += 1
     while index < len(value):
-        character = value[index]
-        next_character = value[index + 1] if index + 1 < len(value) else ""
-        if character == quote:
-            if next_character == quote:
-                index += 2
-                continue
-            return index + 1
-        if character == "\\" and next_character:
-            index += 2
-            continue
-        index += 1
+        index, remaining_quote = _quoted_scan_step(value, index, quote)
+        if remaining_quote is None:
+            return index
     raise DdlParseError("unterminated quoted Hive string")
 
 
@@ -356,30 +348,11 @@ def _balanced_expression_end(
         index += 1
     if index >= len(value) or value[index] != "(":
         raise DdlParseError(f"{label} must contain a parenthesized expression")
-    depth = 0
-    quote: str | None = None
-    while index < len(value):
-        character = value[index]
-        next_character = value[index + 1] if index + 1 < len(value) else ""
-        if quote is not None:
-            if character == quote:
-                if next_character == quote:
-                    index += 2
-                    continue
-                quote = None
-            elif character == "\\" and next_character:
-                index += 2
-                continue
-        elif character in {"'", '"'}:
-            quote = character
-        elif character == "(":
-            depth += 1
-        elif character == ")":
-            depth -= 1
-            if depth == 0:
-                return index + 1
-        index += 1
-    raise DdlParseError(f"unclosed {label} expression")
+    return _matching_parenthesis_end(
+        value,
+        index,
+        label=f"{label} expression",
+    )
 
 
 def _parenthesized_contents(
@@ -393,6 +366,30 @@ def _parenthesized_contents(
         opening += 1
     end = _balanced_expression_end(value, start, label=label)
     return value[opening + 1 : end - 1], end
+
+
+def _validate_identifier_list(value: str, *, label: str) -> None:
+    parts = tuple(_top_level_parts(value))
+    if not parts or any(
+        re.fullmatch(rf"\s*{_IDENTIFIER}\s*", part, flags=re.DOTALL) is None for part in parts
+    ):
+        raise DdlParseError(f"{label} must contain only column identifiers")
+
+
+def _validate_sort_list(value: str) -> None:
+    parts = tuple(_top_level_parts(value))
+    if not parts or any(
+        re.fullmatch(
+            rf"\s*{_IDENTIFIER}(?:\s+(?:ASC|DESC))?\s*",
+            part,
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+        is None
+        for part in parts
+    ):
+        raise DdlParseError(
+            "SORTED BY must contain only column identifiers with optional ASC or DESC"
+        )
 
 
 def _validate_properties(value: str, *, label: str) -> None:
@@ -409,7 +406,11 @@ def _validate_properties(value: str, *, label: str) -> None:
         raise DdlParseError(f"{label} must contain quoted key/value pairs")
 
 
-def _parse_column_clauses(value: str) -> str | None:
+def _parse_column_clauses(
+    value: str,
+    *,
+    allow_constraints: bool = True,
+) -> str | None:
     """Validate column clauses and return their semantic Hive comment."""
     remaining = value.strip()
     comment: str | None = None
@@ -421,6 +422,10 @@ def _parse_column_clauses(value: str) -> str | None:
             comment, end = _quoted_literal(remaining, len("COMMENT"))
             remaining = remaining[end:].strip()
             continue
+        if not allow_constraints:
+            raise DdlParseError(
+                "PARTITIONED BY columns may contain only a data type and optional COMMENT"
+            )
         match = re.match(
             rf"NOT\s+NULL{_CONSTRAINT_MODIFIERS}",
             remaining,
@@ -549,11 +554,12 @@ def _parse_table_tail(value: str) -> tuple[tuple[Column, ...], str | None]:
                 r"CLUSTERED\s+BY",
                 label="CLUSTERED BY",
             )
-            end = _balanced_expression_end(
+            contents, end = _parenthesized_contents(
                 remaining,
                 start,
                 label="CLUSTERED BY",
             )
+            _validate_identifier_list(contents, label="CLUSTERED BY")
             remaining = remaining[end:].strip()
             if re.match(r"SORTED\b", remaining, flags=re.IGNORECASE):
                 start = _consume_keyword(
@@ -561,18 +567,23 @@ def _parse_table_tail(value: str) -> tuple[tuple[Column, ...], str | None]:
                     r"SORTED\s+BY",
                     label="SORTED BY",
                 )
-                end = _balanced_expression_end(
+                contents, end = _parenthesized_contents(
                     remaining,
                     start,
                     label="SORTED BY",
                 )
+                _validate_sort_list(contents)
                 remaining = remaining[end:].strip()
-            end = _consume_keyword(
+            match = re.match(
+                r"INTO\s+(?P<count>[0-9]+)\s+BUCKETS\b",
                 remaining,
-                r"INTO\s+\d+\s+BUCKETS\b",
-                label="CLUSTERED BY",
+                flags=re.IGNORECASE,
             )
-            remaining = remaining[end:].strip()
+            if match is None:
+                raise DdlParseError("malformed CLUSTERED BY clause")
+            if not any(digit != "0" for digit in match.group("count")):
+                raise DdlParseError("CLUSTERED BY bucket count must be positive")
+            remaining = remaining[match.end() :].strip()
             continue
         if re.match(r"SKEWED\b", upper):
             previous_order = _record_table_clause(
@@ -585,7 +596,12 @@ def _parse_table_tail(value: str) -> tuple[tuple[Column, ...], str | None]:
                 r"SKEWED\s+BY",
                 label="SKEWED BY",
             )
-            end = _balanced_expression_end(remaining, start, label="SKEWED BY")
+            contents, end = _parenthesized_contents(
+                remaining,
+                start,
+                label="SKEWED BY",
+            )
+            _validate_identifier_list(contents, label="SKEWED BY")
             remaining = remaining[end:].strip()
             start = _consume_keyword(remaining, r"ON\b", label="SKEWED BY")
             end = _balanced_expression_end(remaining, start, label="SKEWED BY")
@@ -633,14 +649,19 @@ def _parse_table_tail(value: str) -> tuple[tuple[Column, ...], str | None]:
                 label="ROW FORMAT",
             )
             remaining = remaining[start:].strip()
-            row_patterns = (
-                r"FIELDS\s+TERMINATED\s+BY",
-                r"ESCAPED\s+BY",
-                r"COLLECTION\s+ITEMS\s+TERMINATED\s+BY",
-                r"MAP\s+KEYS\s+TERMINATED\s+BY",
-                r"LINES\s+TERMINATED\s+BY",
-                r"NULL\s+DEFINED\s+AS",
+            row_options = (
+                ("FIELDS TERMINATED BY", r"FIELDS\s+TERMINATED\s+BY"),
+                ("ESCAPED BY", r"ESCAPED\s+BY"),
+                (
+                    "COLLECTION ITEMS TERMINATED BY",
+                    r"COLLECTION\s+ITEMS\s+TERMINATED\s+BY",
+                ),
+                ("MAP KEYS TERMINATED BY", r"MAP\s+KEYS\s+TERMINATED\s+BY"),
+                ("LINES TERMINATED BY", r"LINES\s+TERMINATED\s+BY"),
+                ("NULL DEFINED AS", r"NULL\s+DEFINED\s+AS"),
             )
+            seen_row_options: set[str] = set()
+            previous_row_option = -1
             while remaining and not re.match(
                 (
                     r"(?:COMMENT|PARTITIONED|CLUSTERED|SKEWED|ROW|STORED|"
@@ -649,10 +670,27 @@ def _parse_table_tail(value: str) -> tuple[tuple[Column, ...], str | None]:
                 remaining,
                 flags=re.IGNORECASE,
             ):
-                for pattern in row_patterns:
+                for option_order, (option, pattern) in enumerate(row_options):
                     match = re.match(pattern, remaining, flags=re.IGNORECASE)
                     if match:
+                        if option in seen_row_options:
+                            raise DdlParseError(
+                                f"duplicate {option} option in ROW FORMAT DELIMITED"
+                            )
+                        if option_order < previous_row_option:
+                            raise DdlParseError(
+                                f"{option} option is out of order in ROW FORMAT DELIMITED"
+                            )
+                        if (
+                            option == "ESCAPED BY"
+                            and "FIELDS TERMINATED BY" not in seen_row_options
+                        ):
+                            raise DdlParseError(
+                                "ESCAPED BY requires FIELDS TERMINATED BY in ROW FORMAT DELIMITED"
+                            )
                         end = _quoted_literal_end(remaining, match.end())
+                        seen_row_options.add(option)
+                        previous_row_option = option_order
                         remaining = remaining[end:].strip()
                         break
                 else:
@@ -769,17 +807,10 @@ def _statement_end(sql: str, start: int) -> int:
     index = start
     while index < len(sql):
         character = sql[index]
-        next_character = sql[index + 1] if index + 1 < len(sql) else ""
         if quote is not None:
-            if character == quote:
-                if next_character == quote:
-                    index += 2
-                    continue
-                quote = None
-            elif character == "\\" and next_character:
-                index += 2
-                continue
-        elif character in {"'", '"', "`"}:
+            index, quote = _quoted_scan_step(sql, index, quote)
+            continue
+        if character in {"'", '"', "`"}:
             quote = character
         elif character == ";":
             return index + 1
@@ -801,14 +832,10 @@ def _qualified_name(raw_name: str) -> tuple[str | None, str]:
     index = 0
     while index < len(raw_name):
         character = raw_name[index]
-        next_character = raw_name[index + 1] if index + 1 < len(raw_name) else ""
         if quote is not None:
-            if character == quote:
-                if next_character == quote:
-                    index += 2
-                    continue
-                quote = None
-        elif character == "`":
+            index, quote = _quoted_scan_step(raw_name, index, quote)
+            continue
+        if character == "`":
             quote = character
         elif character == ".":
             parts.append(raw_name[start:index].strip())
@@ -891,14 +918,13 @@ class _TypeParser:
         if quote == "`":
             self.index += 1
             while self.index < len(self.value):
-                character = self.value[self.index]
-                if character == quote:
-                    if self.index + 1 < len(self.value) and self.value[self.index + 1] == quote:
-                        self.index += 2
-                        continue
-                    self.index += 1
+                self.index, remaining_quote = _quoted_scan_step(
+                    self.value,
+                    self.index,
+                    quote,
+                )
+                if remaining_quote is None:
                     return
-                self.index += 1
             raise DdlParseError("unterminated STRUCT field name")
         match = re.match(r"[A-Za-z_][A-Za-z0-9_]*", self.value[self.index :])
         if match is None:
@@ -1027,7 +1053,10 @@ def _columns(
         match = _COLUMN.match(definition)
         if match is None:
             raise DdlParseError("cannot parse a column definition")
-        data_type, comment = _split_column_clauses(match.group("type"))
+        data_type, comment = _split_column_clauses(
+            match.group("type"),
+            allow_constraints=allow_constraints,
+        )
         if not data_type:
             raise DdlParseError("a column is missing its data type")
         _validate_type(data_type)
@@ -1045,6 +1074,7 @@ def _columns(
 
 def parse_hive_ddl(sql: str) -> tuple[Table, ...]:
     """Parse all CREATE TABLE statements in a UTF-8 SQL document."""
+    sql = sql.removeprefix("\ufeff")
     cleaned = _without_comments(sql)
     quoted = _quoted_character_mask(cleaned)
     matches = [match for match in _CREATE_TABLE.finditer(cleaned) if not quoted[match.start()]]

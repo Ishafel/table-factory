@@ -866,6 +866,11 @@ docker compose run --rm \
   table-factory -m build
 ```
 
+Release sdist содержит runtime-пакет и документацию, но намеренно не включает
+набор тестов из репозитория: contract-тесты зависят от fixtures, Docker/Compose
+и других файлов полного checkout. Для запуска тестов используйте исходный
+репозиторий, а не распакованный sdist.
+
 После изменения `pyproject.toml`, зависимостей или `Dockerfile` сначала
 пересоберите development image:
 
@@ -885,7 +890,14 @@ TABLE_FACTORY_RUN_DOCKER_TESTS=1 pytest -q tests/test_docker_runtime.py
 
 ## Установка и запуск без Docker
 
-Для установки wheel нужен Python 3.12 или новее:
+Нативный CLI поддерживается только на POSIX-системах с безопасными
+descriptor-relative файловыми операциями (в частности, Linux и macOS) и
+требует Python 3.12 или новее. На Windows используйте Docker-first запуск из
+раздела «Быстрый старт»: нативная установка wheel там не поддерживается.
+Метка wheel `py3-none-any` означает отсутствие бинарных расширений, но не
+расширяет этот явно объявленный runtime-контракт на Windows.
+
+Установка wheel на поддерживаемой POSIX-системе:
 
 ```bash
 VERSION=0.1.0

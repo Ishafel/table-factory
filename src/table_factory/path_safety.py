@@ -91,14 +91,16 @@ def has_untrusted_symlink_component(path: Path) -> bool:
 
 def _require_secure_descriptor_operations() -> None:
     if (
-        not hasattr(os, "O_DIRECTORY")
+        os.name != "posix"
+        or not hasattr(os, "O_DIRECTORY")
         or not hasattr(os, "O_NOFOLLOW")
         or os.open not in os.supports_dir_fd
         or os.stat not in os.supports_dir_fd
         or os.mkdir not in os.supports_dir_fd
     ):
         raise SecurePathUnsupportedError(
-            "secure descriptor-relative path operations are unavailable"
+            "the native CLI requires POSIX descriptor-relative path operations; "
+            "use the Docker workflow on Windows or another unsupported platform"
         )
 
 

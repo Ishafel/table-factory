@@ -1,0 +1,3 @@
+# The test suite depends on repository-only fixtures and Docker contract assets.
+# Release source archives intentionally contain the runtime package, not tests.
+prune tests

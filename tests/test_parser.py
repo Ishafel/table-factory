@@ -11,6 +11,18 @@ from table_factory.parser import parse_hive_ddl
 from table_factory.sql import hive_string
 
 
+def test_one_leading_utf8_bom_is_ignored() -> None:
+    table = parse_hive_ddl("\ufeffCREATE TABLE bom_table (id BIGINT);")[0]
+
+    assert table.name == "bom_table"
+    assert table.create_sql == "CREATE TABLE bom_table (id BIGINT);"
+
+
+def test_only_one_leading_utf8_bom_is_ignored() -> None:
+    with pytest.raises(DdlParseError, match="only CREATE TABLE statements are supported"):
+        parse_hive_ddl("\ufeff\ufeffCREATE TABLE bom_table (id BIGINT);")
+
+
 def test_create_table_text_inside_comment_literal_is_not_a_second_table() -> None:
     tables = parse_hive_ddl(
         "CREATE TABLE real (note STRING COMMENT 'CREATE TABLE phantom (id INT)');"
@@ -107,6 +119,28 @@ def test_doubled_identifier_quotes_are_unescaped() -> None:
 
     assert table.name == "sales`daily"
     assert table.columns[0].name == "order`id"
+
+
+def test_backtick_column_identifier_may_end_with_a_backslash() -> None:
+    table = parse_hive_ddl(r"CREATE TABLE escaped (`owner\` STRING);")[0]
+
+    assert table.columns[0].name == "owner\\"
+
+
+def test_backtick_partition_identifier_may_end_with_a_backslash() -> None:
+    table = parse_hive_ddl(r"CREATE TABLE escaped (id INT) PARTITIONED BY (`owner\` STRING);")[0]
+
+    assert table.partition_columns[0].name == "owner\\"
+
+
+def test_doubled_backticks_are_preserved_before_a_terminal_backslash() -> None:
+    table = parse_hive_ddl(
+        r"CREATE TABLE escaped (`owner``\` STRING) "
+        r"PARTITIONED BY (`partition``\` STRING);"
+    )[0]
+
+    assert table.columns[0].name == "owner`\\"
+    assert table.partition_columns[0].name == "partition`\\"
 
 
 def test_hive_comment_escapes_are_decoded_and_rendered_losslessly() -> None:
@@ -258,6 +292,93 @@ def test_table_clauses_are_validated_and_preserved_verbatim() -> None:
     assert table.external is True
     assert table.comment == "events table"
     assert [column.name for column in table.partition_columns] == ["event_day"]
+
+
+def test_parenthesized_hive_clauses_support_backtick_identifiers() -> None:
+    ddl = (
+        "CREATE TABLE events (`owner's` STRING, `sort``'key` INT) "
+        "PARTITIONED BY (`partition``er's` STRING COMMENT 'partition owner') "
+        "CLUSTERED BY (`owner's`) "
+        "SORTED BY (`sort``'key` DESC) INTO 2 BUCKETS;"
+    )
+
+    table = parse_hive_ddl(ddl)[0]
+
+    assert [column.name for column in table.columns] == ["owner's", "sort`'key"]
+    assert table.partition_columns[0].name == "partition`er's"
+    assert table.partition_columns[0].comment == "partition owner"
+
+
+@pytest.mark.parametrize(
+    "tail",
+    (
+        "CLUSTERED BY () INTO 4 BUCKETS",
+        "CLUSTERED BY (id +) INTO 4 BUCKETS",
+        "CLUSTERED BY (id) SORTED BY (id +) INTO 4 BUCKETS",
+        "CLUSTERED BY (id) SORTED BY (id DESC NULLS FIRST) INTO 4 BUCKETS",
+        "SKEWED BY (id +) ON (1)",
+    ),
+)
+def test_malformed_hive_identifier_and_sort_lists_are_rejected(tail: str) -> None:
+    with pytest.raises(DdlParseError):
+        parse_hive_ddl(f"CREATE TABLE events (id BIGINT) {tail};")
+
+
+@pytest.mark.parametrize("bucket_count", ("0", "000"))
+def test_clustered_by_requires_a_positive_bucket_count(bucket_count: str) -> None:
+    with pytest.raises(DdlParseError, match="bucket count must be positive"):
+        parse_hive_ddl(
+            f"CREATE TABLE events (id BIGINT) CLUSTERED BY (id) INTO {bucket_count} BUCKETS;"
+        )
+
+
+def test_clustered_by_requires_an_ascii_bucket_count() -> None:
+    with pytest.raises(DdlParseError, match="malformed CLUSTERED BY clause"):
+        parse_hive_ddl("CREATE TABLE events (id BIGINT) CLUSTERED BY (id) INTO ١ BUCKETS;")
+
+
+@pytest.mark.parametrize(
+    "options",
+    (
+        "FIELDS TERMINATED BY ',' FIELDS TERMINATED BY '|'",
+        "COLLECTION ITEMS TERMINATED BY ':' FIELDS TERMINATED BY ','",
+        r"ESCAPED BY '\\'",
+        r"FIELDS TERMINATED BY ',' ESCAPED BY '\\' ESCAPED BY '!'",
+    ),
+)
+def test_row_format_delimited_option_order_and_uniqueness_are_validated(
+    options: str,
+) -> None:
+    with pytest.raises(DdlParseError):
+        parse_hive_ddl(f"CREATE TABLE events (id BIGINT) ROW FORMAT DELIMITED {options};")
+
+
+def test_row_format_delimited_options_in_official_order_are_accepted() -> None:
+    ddl = (
+        r"CREATE TABLE events (id BIGINT) ROW FORMAT DELIMITED "
+        r"FIELDS TERMINATED BY ',' ESCAPED BY '\\' "
+        r"COLLECTION ITEMS TERMINATED BY ':' MAP KEYS TERMINATED BY '=' "
+        r"LINES TERMINATED BY '\n' NULL DEFINED AS '\N';"
+    )
+
+    assert parse_hive_ddl(ddl)[0].create_sql == ddl
+
+
+@pytest.mark.parametrize(
+    "partition_definition",
+    (
+        "p INT NOT NULL",
+        "p INT DEFAULT 0",
+        "p INT CHECK (p > 0)",
+        "p INT PRIMARY KEY",
+        "p INT COMMENT 'partition key' NOT NULL",
+    ),
+)
+def test_partition_columns_reject_non_comment_constraints(
+    partition_definition: str,
+) -> None:
+    with pytest.raises(DdlParseError, match="data type and optional COMMENT"):
+        parse_hive_ddl(f"CREATE TABLE events (id BIGINT) PARTITIONED BY ({partition_definition});")
 
 
 @pytest.mark.parametrize(

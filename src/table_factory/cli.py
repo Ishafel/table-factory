@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import stat
 import sys
 from collections.abc import Sequence
+from contextlib import suppress
 from pathlib import Path
 
 from table_factory.config import load_config
@@ -106,12 +108,43 @@ def _run(arguments: argparse.Namespace, *, cwd: Path) -> int:
     raise TableFactoryError("unknown command")
 
 
+def _current_working_directory() -> Path:
+    try:
+        return Path.cwd()
+    except OSError:
+        raise TableFactoryError("current working directory is unavailable") from None
+
+
+def _silence_broken_stdout() -> None:
+    """Prevent interpreter shutdown from flushing a closed pipe again."""
+    try:
+        stdout_descriptor = sys.stdout.fileno()
+    except (AttributeError, OSError, ValueError):
+        return
+    try:
+        null_descriptor = os.open(os.devnull, os.O_WRONLY)
+    except OSError:
+        return
+    try:
+        os.dup2(null_descriptor, stdout_descriptor)
+    except OSError:
+        pass
+    finally:
+        with suppress(OSError):
+            os.close(null_descriptor)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """Run the CLI and return a process exit code."""
     parser = _parser()
     arguments = parser.parse_args(argv)
     try:
-        return _run(arguments, cwd=Path.cwd())
+        exit_code = _run(arguments, cwd=_current_working_directory())
+        sys.stdout.flush()
+        return exit_code
+    except BrokenPipeError:
+        _silence_broken_stdout()
+        return 0
     except TableFactoryError as error:
         print(f"table-factory: error: {error}", file=sys.stderr)
         return 2

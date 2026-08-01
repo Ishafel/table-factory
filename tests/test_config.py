@@ -592,6 +592,19 @@ def test_configuration_rejects_unknown_keys_at_every_level(
         _load(tmp_path, _with_unknown_key(path))
 
 
+def test_configuration_escapes_terminal_controls_in_unknown_keys(
+    tmp_path: Path,
+) -> None:
+    unsafe_key = "evil\x1b[2J"
+
+    with pytest.raises(ConfigurationError) as captured:
+        _load(tmp_path, _with_unknown_key("", key=unsafe_key))
+
+    message = str(captured.value)
+    assert message == r"configuration contains unknown key: evil\u001b[2J"
+    assert "\x1b" not in message
+
+
 @pytest.mark.parametrize(
     "path",
     [

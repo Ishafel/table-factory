@@ -13,6 +13,9 @@ license-files = ["LICENSE"]
 authors = [
   { name = "table-factory contributors" },
 ]
+classifiers = [
+  "Operating System :: POSIX",
+]
 dependencies = [
   "PyYAML>=6.0,<7",
 ]
@@ -23,7 +26,9 @@ dev = [
   "mypy>=1.14,<2",
   "pytest>=8.3,<9",
   "ruff>=0.9,<1",
+  "setuptools>=77",
   "types-PyYAML>=6.0,<7",
+  "wheel",
 ]
 
 [project.scripts]

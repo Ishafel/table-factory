@@ -4,6 +4,8 @@ import re
 import shlex
 import shutil
 import subprocess
+import sys
+import tarfile
 import tomllib
 from pathlib import Path
 from typing import Any
@@ -217,6 +219,7 @@ def test_python_package_declares_cli_and_complete_dev_extra() -> None:
     project = document["project"]
     assert project["name"] == "table-factory"
     assert ">=3.12" in project["requires-python"].replace(" ", "")
+    assert "Operating System :: POSIX" in project.get("classifiers", [])
 
     scripts = project.get("scripts", {})
     assert "table-factory" in scripts
@@ -227,8 +230,50 @@ def test_python_package_declares_cli_and_complete_dev_extra() -> None:
         re.split(r"[\s<>=!~;\[]", requirement, maxsplit=1)[0].lower()
         for requirement in dev_requirements
     }
-    assert {"pytest", "ruff", "mypy", "build"} <= normalized
+    assert {"pytest", "ruff", "mypy", "build", "setuptools", "wheel"} <= normalized
 
     build_system = document.get("build-system", {})
     assert build_system.get("build-backend")
     assert build_system.get("requires")
+
+
+def test_sdist_excludes_the_repository_only_test_suite(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    for filename in ("LICENSE", "MANIFEST.in", "README.md", "pyproject.toml"):
+        shutil.copy2(PROJECT_ROOT / filename, source / filename)
+    shutil.copytree(
+        PROJECT_ROOT / "src",
+        source / "src",
+        ignore=shutil.ignore_patterns("__pycache__", "*.egg-info"),
+    )
+    shutil.copytree(
+        PROJECT_ROOT / "tests",
+        source / "tests",
+        ignore=shutil.ignore_patterns("__pycache__"),
+    )
+    dist = tmp_path / "dist"
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "build",
+            "--sdist",
+            "--no-isolation",
+            "--outdir",
+            str(dist),
+            ".",
+        ],
+        cwd=source,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+    archives = list(dist.glob("table_factory-*.tar.gz"))
+    assert len(archives) == 1
+    with tarfile.open(archives[0], mode="r:gz") as archive:
+        payload_names = [name.partition("/")[2] for name in archive.getnames()]
+
+    assert not [name for name in payload_names if name == "tests" or name.startswith("tests/")]

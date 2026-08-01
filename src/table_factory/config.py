@@ -281,6 +281,16 @@ def _mapping(value: object, label: str) -> dict[str, Any]:
     return value
 
 
+def _safe_diagnostic_text(value: str) -> str:
+    """Escape terminal control characters before including user text in errors."""
+    return "".join(
+        character
+        if character.isprintable() and character not in "\r\n"
+        else f"\\u{ord(character):04x}"
+        for character in value
+    )
+
+
 def _keys(
     value: dict[str, Any],
     *,
@@ -290,7 +300,8 @@ def _keys(
 ) -> None:
     unknown = sorted(set(value) - allowed)
     if unknown:
-        raise ConfigurationError(f"{label} contains unknown key: {unknown[0]}")
+        safe_key = _safe_diagnostic_text(unknown[0])
+        raise ConfigurationError(f"{label} contains unknown key: {safe_key}")
     required_keys = allowed if required is None else required
     missing = sorted(required_keys - set(value))
     if missing:
@@ -674,12 +685,7 @@ def _safe_display_name(display_name: str) -> str:
     label = candidate.name if candidate.is_absolute() else candidate.as_posix()
     if not label:
         label = "."
-    return "".join(
-        character
-        if character.isprintable() and character not in "\r\n"
-        else f"\\u{ord(character):04x}"
-        for character in label
-    )
+    return _safe_diagnostic_text(label)
 
 
 def _read_config(path: Path, *, display_name: str) -> str:

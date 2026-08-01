@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 
 import pytest
@@ -9,6 +10,7 @@ from conftest import invoke_cli, parse_json_output
 import table_factory.generator as generator_module
 import table_factory.path_safety as path_safety_module
 import table_factory.workflow as workflow_module
+from table_factory.cli import main
 from table_factory.config import ARTIFACT_ROLES
 from table_factory.errors import OutputSafetyError, TableFactoryError
 from table_factory.generator import Artifact, write_artifacts
@@ -49,6 +51,98 @@ def test_help_exposes_the_three_documented_commands(tmp_path: Path) -> None:
         assert command in result.stdout
 
 
+def test_validate_accepts_a_file_with_one_leading_utf8_bom(
+    cli_case: dict[str, Path],
+) -> None:
+    cli_case["ddl"].write_bytes(b"\xef\xbb\xbfCREATE TABLE bom_table (id BIGINT);\n")
+
+    result = invoke_cli(
+        "validate",
+        "--input",
+        cli_case["ddl"],
+        "--config",
+        cli_case["config"],
+        cwd=cli_case["root"],
+    )
+
+    assert result.returncode == 0
+    assert "Validated 1 table(s)" in result.stdout
+
+
+@pytest.mark.parametrize("command", ("generate", "validate", "inspect"))
+def test_cli_handles_a_closed_stdout_pipe_without_a_traceback(
+    cli_case: dict[str, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    command: str,
+) -> None:
+    if command == "generate":
+        arguments = (
+            "generate",
+            "--input",
+            str(cli_case["ddl"]),
+            "--output",
+            str(cli_case["output"]),
+            "--config",
+            str(cli_case["config"]),
+        )
+    elif command == "validate":
+        arguments = (
+            "validate",
+            "--input",
+            str(cli_case["ddl"]),
+            "--config",
+            str(cli_case["config"]),
+        )
+    else:
+        arguments = (
+            "inspect",
+            str(cli_case["ddl"]),
+            "--config",
+            str(cli_case["config"]),
+        )
+
+    read_descriptor, write_descriptor = os.pipe()
+    os.close(read_descriptor)
+    closed_pipe = os.fdopen(write_descriptor, "w")
+    monkeypatch.setattr(sys, "stdout", closed_pipe)
+    try:
+        assert main(arguments) == 0
+    finally:
+        closed_pipe.close()
+
+
+def test_cli_normalizes_an_unavailable_current_working_directory(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    original_cwd = Path.cwd()
+    removed_cwd = tmp_path / "removed-cwd"
+    removed_cwd.mkdir()
+    os.chdir(removed_cwd)
+    try:
+        try:
+            removed_cwd.rmdir()
+        except OSError as error:
+            pytest.skip(f"The platform cannot remove the current directory: {error}")
+        exit_code = main(
+            (
+                "validate",
+                "--input",
+                "input.sql",
+                "--config",
+                "config.yaml",
+            )
+        )
+    finally:
+        os.chdir(original_cwd)
+
+    captured = capsys.readouterr()
+    assert exit_code == 2
+    assert captured.out == ""
+    assert captured.err == ("table-factory: error: current working directory is unavailable\n")
+    assert "Traceback" not in captured.err
+
+
 @pytest.mark.skipif(
     not hasattr(os, "symlink"),
     reason="The platform cannot create symlinks",
@@ -72,6 +166,21 @@ def test_root_owned_system_path_aliases_are_not_treated_as_user_symlinks() -> No
     aliases = [path for path in (Path("/var"), Path("/tmp")) if path.is_symlink()]
     if aliases:
         assert all(not has_untrusted_symlink_component(path / "folders") for path in aliases)
+
+
+def test_unsupported_native_filesystem_operations_direct_users_to_docker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(path_safety_module.os, "supports_dir_fd", set())
+
+    with pytest.raises(path_safety_module.SecurePathUnsupportedError) as captured:
+        path_safety_module.open_pinned_path(tmp_path, create_directory=False)
+
+    assert str(captured.value) == (
+        "the native CLI requires POSIX descriptor-relative path operations; "
+        "use the Docker workflow on Windows or another unsupported platform"
+    )
 
 
 def test_symlink_component_probe_normalizes_os_errors_without_host_paths(
