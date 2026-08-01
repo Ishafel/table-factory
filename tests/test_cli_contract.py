@@ -6,8 +6,11 @@ from pathlib import Path
 import pytest
 from conftest import invoke_cli, parse_json_output
 
+import table_factory.generator as generator_module
+import table_factory.path_safety as path_safety_module
+import table_factory.workflow as workflow_module
 from table_factory.config import ARTIFACT_ROLES
-from table_factory.errors import OutputSafetyError
+from table_factory.errors import OutputSafetyError, TableFactoryError
 from table_factory.generator import Artifact, write_artifacts
 from table_factory.path_safety import has_untrusted_symlink_component
 from table_factory.workflow import display_path
@@ -826,6 +829,211 @@ def test_output_path_with_a_symlink_parent_component_is_rejected(
     _assert_no_absolute_workspace_path(result.stdout + result.stderr, root)
 
 
+@pytest.mark.skipif(
+    not hasattr(os, "symlink"),
+    reason="The platform cannot create symlinks",
+)
+def test_write_artifacts_pins_the_accepted_output_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output = tmp_path / "output"
+    accepted_output = tmp_path / "accepted-output"
+    outside = tmp_path / "outside"
+    output.mkdir()
+    outside.mkdir()
+    outside_destination = outside / "escaped.sql"
+    outside_destination.write_text("outside sentinel\n", encoding="utf-8")
+    artifact = Artifact(filename="escaped.sql", content="generated\n")
+
+    real_write_staged_file = generator_module._write_staged_file
+    swapped = False
+
+    def swap_output_after_it_is_pinned(
+        output_directory_fd: int,
+        pending_artifact: Artifact,
+    ) -> str:
+        nonlocal swapped
+        if not swapped:
+            swapped = True
+            output.rename(accepted_output)
+            output.symlink_to(outside, target_is_directory=True)
+        return real_write_staged_file(output_directory_fd, pending_artifact)
+
+    monkeypatch.setattr(generator_module, "_write_staged_file", swap_output_after_it_is_pinned)
+
+    write_artifacts(output, [artifact])
+
+    assert (accepted_output / artifact.filename).read_text(encoding="utf-8") == "generated\n"
+    assert outside_destination.read_text(encoding="utf-8") == "outside sentinel\n"
+    assert not list(outside.glob("*.tmp"))
+    assert not list(outside.glob("*.bak"))
+
+
+@pytest.mark.skipif(
+    not hasattr(os, "symlink"),
+    reason="The platform cannot create symlinks",
+)
+def test_parse_files_reads_from_the_pinned_input_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    input_directory = tmp_path / "input"
+    accepted_input = tmp_path / "accepted-input"
+    outside = tmp_path / "outside"
+    input_directory.mkdir()
+    outside.mkdir()
+    source = input_directory / "source.sql"
+    source.write_text("CREATE TABLE original_table (id BIGINT);\n", encoding="utf-8")
+    (outside / source.name).write_text(
+        "CREATE TABLE outside_table (id BIGINT);\n",
+        encoding="utf-8",
+    )
+
+    real_open_verified_entry = workflow_module.open_verified_entry
+    swapped = False
+
+    def swap_input_after_it_is_pinned(
+        directory_fd: int,
+        name: str,
+        checked_status: os.stat_result,
+        *,
+        expected: str,
+        final_component: bool = False,
+    ) -> tuple[int, os.stat_result]:
+        nonlocal swapped
+        if name == source.name and expected == "regular" and not swapped:
+            swapped = True
+            input_directory.rename(accepted_input)
+            input_directory.symlink_to(outside, target_is_directory=True)
+        return real_open_verified_entry(
+            directory_fd,
+            name,
+            checked_status,
+            expected=expected,
+            final_component=final_component,
+        )
+
+    monkeypatch.setattr(workflow_module, "open_verified_entry", swap_input_after_it_is_pinned)
+
+    parsed = workflow_module.parse_files(input_directory, cwd=tmp_path)
+
+    assert parsed[0].tables[0].name == "original_table"
+    accepted_status = (accepted_input / source.name).stat()
+    assert parsed[0].identity.device == accepted_status.st_dev
+    assert parsed[0].identity.inode == accepted_status.st_ino
+
+
+def test_parse_files_rejects_an_input_file_identity_change(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    input_directory = tmp_path / "input"
+    input_directory.mkdir()
+    source = input_directory / "source.sql"
+    accepted_source = input_directory / "accepted-source.sql"
+    replacement = tmp_path / "replacement.sql"
+    source.write_text("CREATE TABLE original_table (id BIGINT);\n", encoding="utf-8")
+    replacement.write_text("CREATE TABLE replacement_table (id BIGINT);\n", encoding="utf-8")
+
+    real_open_verified_entry = workflow_module.open_verified_entry
+    swapped = False
+
+    def swap_file_between_stat_and_open(
+        directory_fd: int,
+        name: str,
+        checked_status: os.stat_result,
+        *,
+        expected: str,
+        final_component: bool = False,
+    ) -> tuple[int, os.stat_result]:
+        nonlocal swapped
+        if name == source.name and expected == "regular" and not swapped:
+            swapped = True
+            source.rename(accepted_source)
+            os.replace(replacement, source)
+        return real_open_verified_entry(
+            directory_fd,
+            name,
+            checked_status,
+            expected=expected,
+            final_component=final_component,
+        )
+
+    monkeypatch.setattr(workflow_module, "open_verified_entry", swap_file_between_stat_and_open)
+
+    with pytest.raises(TableFactoryError, match="cannot read input"):
+        workflow_module.parse_files(input_directory, cwd=tmp_path)
+
+    assert accepted_source.read_text(encoding="utf-8").startswith("CREATE TABLE original_table")
+
+
+@pytest.mark.skipif(
+    not hasattr(os, "mkfifo"),
+    reason="The platform cannot create FIFOs",
+)
+def test_parse_files_cannot_block_on_a_file_replaced_by_a_fifo(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    input_directory = tmp_path / "input"
+    input_directory.mkdir()
+    source = input_directory / "source.sql"
+    accepted_source = input_directory / "accepted-source.sql"
+    source.write_text("CREATE TABLE original_table (id BIGINT);\n", encoding="utf-8")
+
+    real_open_flags = path_safety_module._open_flags
+    swapped = False
+
+    def replace_file_with_fifo_before_open(
+        *,
+        expected: str,
+        nofollow: bool,
+    ) -> int:
+        nonlocal swapped
+        flags = real_open_flags(expected=expected, nofollow=nofollow)
+        if expected == "regular" and not swapped:
+            swapped = True
+            source.rename(accepted_source)
+            os.mkfifo(source)
+            assert flags & os.O_NONBLOCK
+        return flags
+
+    monkeypatch.setattr(path_safety_module, "_open_flags", replace_file_with_fifo_before_open)
+
+    with pytest.raises(TableFactoryError, match="cannot read input"):
+        workflow_module.parse_files(input_directory, cwd=tmp_path)
+
+
+@pytest.mark.skipif(
+    not hasattr(os, "symlink") or not hasattr(os, "link"),
+    reason="The platform cannot create symlinks and hard links",
+)
+def test_write_artifacts_rejects_a_legacy_symlink_input_alias(
+    tmp_path: Path,
+) -> None:
+    input_directory = tmp_path / "input"
+    output_directory = tmp_path / "output"
+    input_directory.mkdir()
+    output_directory.mkdir()
+    source = input_directory / "source.sql"
+    source.write_text("CREATE TABLE original_table (id BIGINT);\n", encoding="utf-8")
+    input_link = input_directory / "source-link.sql"
+    input_link.symlink_to(source)
+    destination = output_directory / "artifact.sql"
+    os.link(source, destination)
+
+    with pytest.raises(OutputSafetyError, match="cannot verify an input SQL file"):
+        write_artifacts(
+            output_directory,
+            [Artifact(filename=destination.name, content="generated\n")],
+            input_paths=(input_link,),
+        )
+
+    assert os.path.samefile(source, destination)
+    assert source.read_text(encoding="utf-8").startswith("CREATE TABLE original_table")
+
+
 def test_write_artifacts_restores_the_whole_set_when_second_commit_fails(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -844,13 +1052,24 @@ def test_write_artifacts_restores_the_whole_set_when_second_commit_fails(
     real_replace = os.replace
     staged_commits = 0
 
-    def fail_second_staged_commit(source: str | Path, destination: str | Path) -> None:
+    def fail_second_staged_commit(
+        source: str | Path,
+        destination: str | Path,
+        *,
+        src_dir_fd: int | None = None,
+        dst_dir_fd: int | None = None,
+    ) -> None:
         nonlocal staged_commits
         if str(source).endswith(".tmp"):
             staged_commits += 1
             if staged_commits == 2:
                 raise OSError("simulated second commit failure")
-        real_replace(source, destination)
+        real_replace(
+            source,
+            destination,
+            src_dir_fd=src_dir_fd,
+            dst_dir_fd=dst_dir_fd,
+        )
 
     monkeypatch.setattr(os, "replace", fail_second_staged_commit)
 
@@ -875,21 +1094,22 @@ def test_write_artifacts_reports_backup_cleanup_failure_without_raw_io_error(
     destination.write_text("old\n", encoding="utf-8")
     artifact = Artifact(filename=destination.name, content="new\n")
 
-    real_unlink = Path.unlink
+    real_unlink = os.unlink
     backup_unlinks = 0
 
     def fail_committed_backup_cleanup(
-        path: Path,
-        missing_ok: bool = False,
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        *,
+        dir_fd: int | None = None,
     ) -> None:
         nonlocal backup_unlinks
-        if path.suffix == ".bak":
+        if str(path).endswith(".bak"):
             backup_unlinks += 1
-            if backup_unlinks == 2:
+            if backup_unlinks == 1:
                 raise PermissionError(13, "Permission denied", str(path))
-        real_unlink(path, missing_ok=missing_ok)
+        real_unlink(path, dir_fd=dir_fd)
 
-    monkeypatch.setattr(Path, "unlink", fail_committed_backup_cleanup)
+    monkeypatch.setattr(os, "unlink", fail_committed_backup_cleanup)
 
     with pytest.raises(
         OutputSafetyError,

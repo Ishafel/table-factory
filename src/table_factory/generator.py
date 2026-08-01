@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import os
 import re
-import tempfile
+import secrets
+import stat
 import unicodedata
 from collections.abc import Callable
 from contextlib import suppress
@@ -25,7 +26,14 @@ from table_factory.hive_renderer import (
 from table_factory.liquibase_renderer import render_greenplum_create_external_liquibase
 from table_factory.models import Table, TablePlan
 from table_factory.naming import build_target_names
-from table_factory.path_safety import has_untrusted_symlink_component
+from table_factory.path_safety import (
+    FileIdentity,
+    PathIdentityChangedError,
+    PathSafetyError,
+    SecurePathUnsupportedError,
+    UntrustedSymlinkError,
+    open_pinned_path,
+)
 from table_factory.type_mapper import map_table_columns
 
 _MAX_STEM_BYTES = 160
@@ -133,24 +141,15 @@ def ensure_unique_artifacts(artifacts: list[Artifact]) -> None:
         raise TableFactoryError(f"multiple tables map to the same output name: {duplicate_list}")
 
 
-def _destination(output_directory: Path, filename: str) -> Path:
-    if Path(filename).name != filename:
+def _destination_name(filename: str) -> str:
+    if not filename or filename in {".", ".."} or Path(filename).name != filename:
         raise OutputSafetyError("generated filename is not a plain filename")
-    destination = output_directory / filename
-    if destination.parent.resolve() != output_directory.resolve():
-        raise OutputSafetyError("generated path would leave the output directory")
-    return destination
+    return filename
 
 
-def _reject_symlink_components(path: Path) -> None:
-    """Reject an output path reached through a user-controlled symbolic link."""
-    if has_untrusted_symlink_component(path):
-        raise OutputSafetyError("output path must not contain a symbolic-link component")
-
-
-def _unlink_error(path: str | Path) -> OSError | None:
+def _unlink_error(directory_fd: int, name: str) -> OSError | None:
     try:
-        Path(path).unlink()
+        os.unlink(name, dir_fd=directory_fd)
     except FileNotFoundError:
         return None
     except OSError as error:
@@ -159,17 +158,16 @@ def _unlink_error(path: str | Path) -> OSError | None:
 
 
 def _write_staged_file(
-    output_directory: Path,
+    output_directory_fd: int,
     artifact: Artifact,
 ) -> str:
     descriptor: int | None = None
     temporary_name: str | None = None
     try:
-        descriptor, temporary_name = tempfile.mkstemp(
-            dir=output_directory,
+        descriptor, temporary_name = _open_exclusive_file(
+            output_directory_fd,
             prefix=f".{artifact.filename}.",
             suffix=".tmp",
-            text=True,
         )
         with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
             descriptor = None
@@ -181,7 +179,11 @@ def _write_staged_file(
         if descriptor is not None:
             with suppress(OSError):
                 os.close(descriptor)
-        cleanup_error = _unlink_error(temporary_name) if temporary_name is not None else None
+        cleanup_error = (
+            _unlink_error(output_directory_fd, temporary_name)
+            if temporary_name is not None
+            else None
+        )
         detail = error.strerror or "I/O error"
         if cleanup_error is not None:
             cleanup_detail = cleanup_error.strerror or "I/O error"
@@ -191,39 +193,100 @@ def _write_staged_file(
         ) from None
 
 
-def _unused_backup_name(output_directory: Path, filename: str) -> str:
-    descriptor, backup_name = tempfile.mkstemp(
-        dir=output_directory,
+def _open_exclusive_file(
+    directory_fd: int,
+    *,
+    prefix: str,
+    suffix: str,
+) -> tuple[int, str]:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+    for _attempt in range(100):
+        name = f"{prefix}{secrets.token_hex(8)}{suffix}"
+        try:
+            descriptor = os.open(name, flags, 0o600, dir_fd=directory_fd)
+        except FileExistsError:
+            continue
+        return descriptor, name
+    raise FileExistsError("cannot allocate a unique transaction filename")
+
+
+def _reserved_backup_name(output_directory_fd: int, filename: str) -> str:
+    descriptor, backup_name = _open_exclusive_file(
+        output_directory_fd,
         prefix=f".{filename}.",
         suffix=".bak",
     )
     os.close(descriptor)
-    Path(backup_name).unlink()
     return backup_name
 
 
-def _reject_input_aliases(
-    destinations: list[tuple[Artifact, Path]],
+def _input_file_identities(
     input_paths: tuple[Path, ...],
+    verified_identities: tuple[FileIdentity, ...],
+) -> frozenset[FileIdentity]:
+    identities = set(verified_identities)
+    for input_path in input_paths:
+        descriptor: int | None = None
+        try:
+            descriptor, status = open_pinned_path(input_path, create_directory=False)
+            if not stat.S_ISREG(status.st_mode):
+                raise OSError("input path is not a regular file")
+            identities.add(FileIdentity.from_stat(status))
+        except (OSError, PathSafetyError) as error:
+            detail = getattr(error, "strerror", None) or str(error) or "I/O error"
+            raise OutputSafetyError(
+                f"cannot verify an input SQL file before writing output: {detail}"
+            ) from None
+        finally:
+            if descriptor is not None:
+                with suppress(OSError):
+                    os.close(descriptor)
+    return frozenset(identities)
+
+
+def _reject_input_aliases(
+    output_directory_fd: int,
+    destinations: list[tuple[Artifact, str]],
+    input_identities: frozenset[FileIdentity],
 ) -> None:
     """Reject any destination that names the same file as a source DDL."""
-    for artifact, destination in destinations:
-        for input_path in input_paths:
-            try:
-                aliases_input = os.path.samefile(destination, input_path)
-            except FileNotFoundError:
-                aliases_input = False
-            except OSError as error:
-                detail = error.strerror or "I/O error"
-                raise OutputSafetyError(
-                    "cannot verify whether generated file "
-                    f"{artifact.filename} aliases an input SQL file: {detail}"
-                ) from None
-            if aliases_input:
-                raise OutputSafetyError(
-                    "refusing to overwrite an input SQL file with generated artifact "
-                    f"{artifact.filename}"
-                )
+    for artifact, destination_name in destinations:
+        try:
+            status = os.stat(
+                destination_name,
+                dir_fd=output_directory_fd,
+                follow_symlinks=True,
+            )
+        except FileNotFoundError:
+            continue
+        except OSError as error:
+            detail = error.strerror or "I/O error"
+            raise OutputSafetyError(
+                "cannot verify whether generated file "
+                f"{artifact.filename} aliases an input SQL file: {detail}"
+            ) from None
+        if FileIdentity.from_stat(status) in input_identities:
+            raise OutputSafetyError(
+                "refusing to overwrite an input SQL file with generated artifact "
+                f"{artifact.filename}"
+            )
+
+
+def _replace_in_directory(directory_fd: int, source: str, destination: str) -> None:
+    os.replace(
+        source,
+        destination,
+        src_dir_fd=directory_fd,
+        dst_dir_fd=directory_fd,
+    )
+
+
+def _destination_exists(output_directory_fd: int, name: str) -> bool:
+    try:
+        os.stat(name, dir_fd=output_directory_fd, follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    return True
 
 
 def write_artifacts(
@@ -231,103 +294,157 @@ def write_artifacts(
     artifacts: list[Artifact],
     *,
     input_paths: tuple[Path, ...] = (),
+    input_identities: tuple[FileIdentity, ...] = (),
 ) -> None:
     """Replace the complete artifact set with rollback on any write failure."""
-    _reject_symlink_components(output_directory)
-
-    destinations: list[tuple[Artifact, Path]] = []
+    destinations: list[tuple[Artifact, str]] = []
     for artifact in artifacts:
-        destination = _destination(output_directory, artifact.filename)
-        if destination.is_dir() and not destination.is_symlink():
-            raise OutputSafetyError(
-                f"cannot write generated file {artifact.filename}: destination is a directory"
-            )
-        destinations.append((artifact, destination))
-    _reject_input_aliases(destinations, input_paths)
+        destinations.append((artifact, _destination_name(artifact.filename)))
+    verified_input_identities = _input_file_identities(input_paths, input_identities)
 
+    output_directory_fd: int | None = None
     try:
-        output_directory.mkdir(parents=True, exist_ok=True)
+        output_directory_fd, _output_status = open_pinned_path(
+            output_directory,
+            create_directory=True,
+        )
+    except UntrustedSymlinkError:
+        raise OutputSafetyError("output path must not contain a symbolic-link component") from None
+    except PathIdentityChangedError:
+        raise OutputSafetyError("output path changed while it was being opened") from None
+    except SecurePathUnsupportedError as error:
+        raise OutputSafetyError(f"cannot safely open output directory: {error}") from None
+    except NotADirectoryError:
+        raise OutputSafetyError("output path is not a directory") from None
     except OSError as error:
-        raise OutputSafetyError(f"cannot create output directory: {error.strerror}") from None
-    _reject_symlink_components(output_directory)
-    if not output_directory.is_dir():
-        raise OutputSafetyError("output path is not a directory")
+        detail = error.strerror or "I/O error"
+        raise OutputSafetyError(f"cannot create output directory: {detail}") from None
 
-    staged: list[tuple[Artifact, Path, str]] = []
-    backups: list[tuple[Path, str]] = []
-    committed: list[Path] = []
-    current_filename = "artifact set"
-    completed = False
-    failure: OutputSafetyError | None = None
     try:
-        for artifact, destination in destinations:
-            current_filename = artifact.filename
-            staged.append(
-                (
-                    artifact,
-                    destination,
-                    _write_staged_file(output_directory, artifact),
+        for artifact, destination_name in destinations:
+            try:
+                destination_status = os.stat(
+                    destination_name,
+                    dir_fd=output_directory_fd,
+                    follow_symlinks=False,
                 )
-            )
-
-        for artifact, destination in destinations:
-            if not os.path.lexists(destination):
+            except FileNotFoundError:
                 continue
-            current_filename = artifact.filename
-            backup_name = _unused_backup_name(
-                output_directory,
-                artifact.filename,
-            )
-            os.replace(destination, backup_name)
-            backups.append((destination, backup_name))
+            except OSError as error:
+                detail = error.strerror or "I/O error"
+                raise OutputSafetyError(
+                    f"cannot inspect generated file {artifact.filename}: {detail}"
+                ) from None
+            if stat.S_ISDIR(destination_status.st_mode):
+                raise OutputSafetyError(
+                    f"cannot write generated file {artifact.filename}: destination is a directory"
+                )
+        _reject_input_aliases(
+            output_directory_fd,
+            destinations,
+            verified_input_identities,
+        )
 
-        for artifact, destination, temporary_name in staged:
-            current_filename = artifact.filename
-            os.replace(temporary_name, destination)
-            committed.append(destination)
-        completed = True
-    except (OSError, OutputSafetyError) as error:
-        rollback_error: OSError | None = None
-        for destination in reversed(committed):
-            try:
-                destination.unlink()
-            except OSError as cleanup_error:
-                rollback_error = rollback_error or cleanup_error
-        for destination, backup_name in reversed(backups):
-            try:
-                os.replace(backup_name, destination)
-            except OSError as restore_error:
-                rollback_error = rollback_error or restore_error
+        staged: list[tuple[Artifact, str, str]] = []
+        backups: list[tuple[str, str]] = []
+        committed: list[str] = []
+        current_filename = "artifact set"
+        completed = False
+        failure: OutputSafetyError | None = None
+        try:
+            for artifact, destination_name in destinations:
+                current_filename = artifact.filename
+                staged.append(
+                    (
+                        artifact,
+                        destination_name,
+                        _write_staged_file(output_directory_fd, artifact),
+                    )
+                )
 
-        if isinstance(error, OutputSafetyError):
-            detail = str(error)
-        else:
-            detail = error.strerror or "I/O error"
-        if rollback_error is not None:
-            rollback_detail = rollback_error.strerror or "I/O error"
-            detail = f"{detail}; rollback failed: {rollback_detail}"
-        failure = OutputSafetyError(f"cannot write generated file {current_filename}: {detail}")
+            for artifact, destination_name in destinations:
+                if not _destination_exists(output_directory_fd, destination_name):
+                    continue
+                current_filename = artifact.filename
+                backup_name = _reserved_backup_name(
+                    output_directory_fd,
+                    artifact.filename,
+                )
+                try:
+                    _replace_in_directory(
+                        output_directory_fd,
+                        destination_name,
+                        backup_name,
+                    )
+                except OSError as error:
+                    cleanup_error = _unlink_error(output_directory_fd, backup_name)
+                    if cleanup_error is not None:
+                        cleanup_detail = cleanup_error.strerror or "I/O error"
+                        detail = error.strerror or "I/O error"
+                        raise OutputSafetyError(
+                            f"{detail}; backup reservation cleanup failed: {cleanup_detail}"
+                        ) from None
+                    raise
+                backups.append((destination_name, backup_name))
 
-    cleanup_failures: list[str] = []
-    for artifact, _destination_path, temporary_name in staged:
-        unlink_failure = _unlink_error(temporary_name)
-        if unlink_failure is not None:
-            cleanup_detail = unlink_failure.strerror or "I/O error"
-            cleanup_failures.append(f"{artifact.filename}: {cleanup_detail}")
-    if completed:
-        for destination, backup_name in backups:
-            unlink_failure = _unlink_error(backup_name)
+            for artifact, destination_name, temporary_name in staged:
+                current_filename = artifact.filename
+                _replace_in_directory(
+                    output_directory_fd,
+                    temporary_name,
+                    destination_name,
+                )
+                committed.append(destination_name)
+            completed = True
+        except (OSError, OutputSafetyError) as error:
+            rollback_error: OSError | None = None
+            for destination_name in reversed(committed):
+                try:
+                    os.unlink(destination_name, dir_fd=output_directory_fd)
+                except OSError as cleanup_error:
+                    rollback_error = rollback_error or cleanup_error
+            for destination_name, backup_name in reversed(backups):
+                try:
+                    _replace_in_directory(
+                        output_directory_fd,
+                        backup_name,
+                        destination_name,
+                    )
+                except OSError as restore_error:
+                    rollback_error = rollback_error or restore_error
+
+            if isinstance(error, OutputSafetyError):
+                detail = str(error)
+            else:
+                detail = error.strerror or "I/O error"
+            if rollback_error is not None:
+                rollback_detail = rollback_error.strerror or "I/O error"
+                detail = f"{detail}; rollback failed: {rollback_detail}"
+            failure = OutputSafetyError(f"cannot write generated file {current_filename}: {detail}")
+
+        cleanup_failures: list[str] = []
+        for artifact, _destination_name_value, temporary_name in staged:
+            unlink_failure = _unlink_error(output_directory_fd, temporary_name)
             if unlink_failure is not None:
                 cleanup_detail = unlink_failure.strerror or "I/O error"
-                cleanup_failures.append(f"{destination.name}: {cleanup_detail}")
+                cleanup_failures.append(f"{artifact.filename}: {cleanup_detail}")
+        if completed:
+            for destination_name, backup_name in backups:
+                unlink_failure = _unlink_error(output_directory_fd, backup_name)
+                if unlink_failure is not None:
+                    cleanup_detail = unlink_failure.strerror or "I/O error"
+                    cleanup_failures.append(f"{destination_name}: {cleanup_detail}")
 
-    if cleanup_failures:
-        cleanup_detail = "; ".join(cleanup_failures)
-        if failure is None:
-            failure = OutputSafetyError(
-                f"generated files were replaced, but transaction cleanup failed: {cleanup_detail}"
-            )
-        else:
-            failure = OutputSafetyError(f"{failure}; cleanup failed: {cleanup_detail}")
-    if failure is not None:
-        raise failure from None
+        if cleanup_failures:
+            cleanup_detail = "; ".join(cleanup_failures)
+            if failure is None:
+                failure = OutputSafetyError(
+                    "generated files were replaced, but transaction cleanup failed: "
+                    f"{cleanup_detail}"
+                )
+            else:
+                failure = OutputSafetyError(f"{failure}; cleanup failed: {cleanup_detail}")
+        if failure is not None:
+            raise failure from None
+    finally:
+        os.close(output_directory_fd)

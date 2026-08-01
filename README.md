@@ -761,6 +761,11 @@ traceback и не раскрывают абсолютные host paths.
   symlink-компоненты input path отклоняются; то же правило действует для
   output directory и её родительских компонентов. Стабильные root-owned
   системные aliases вроде macOS `/var` и `/tmp` разрешены.
+- Input tree закрепляется directory descriptor-ами; каждый SQL-файл открывается
+  относительно проверенного parent descriptor с `O_NOFOLLOW`, сверяется через
+  `fstat` и читается из того же file descriptor. Поэтому замена уже принятого
+  pathname не перенаправляет чтение, а filesystem identity фактически
+  прочитанного файла сохраняется для последующих проверок.
 - Сгенерированное имя является только filename и не может выйти из output
   через path traversal.
 - Ни один destination не может быть тем же файлом, что и прочитанный input
@@ -776,10 +781,16 @@ traceback и не раскрывают абсолютные host paths.
   документы. Для одиночного input-файла это ограничение не требуется.
 - Все input-файлы разбираются, target/type mapping и collisions проверяются до
   записи.
+- Output directory открывается component-by-component и закрепляется directory
+  descriptor-ом. Временные файлы создаются с `O_EXCL | O_NOFOLLOW`, а
+  `replace`, rollback и cleanup выполняются только относительно закреплённого
+  descriptor. Переименование принятого output и установка symlink на его
+  прежнем pathname не могут перенаправить запись.
 - Полный включённый набор артефактов сначала записывается во временные файлы,
   затем destinations заменяются последовательными атомарными `os.replace`.
   Набор в целом не атомарен для параллельного читателя и не является
-  crash-safe.
+  crash-safe. Rollback предполагает единственного writer-а: конкурентное
+  изменение имён внутри уже закреплённого output directory не сериализуется.
 - При ошибке записи выполняется best-effort rollback, включая попытку
   восстановить существовавшие файлы. Если filesystem отказывает и при
   rollback или cleanup, CLI возвращает контролируемую ошибку без traceback, а
