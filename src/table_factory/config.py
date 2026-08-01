@@ -31,6 +31,15 @@ _LOCATION_PLACEHOLDERS = frozenset(
 _GREENPLUM_IDENTIFIER_BYTES = 63
 _CONFIG_VERSION = 3
 _LEGACY_CONFIG_VERSIONS = frozenset({1, 2})
+ARTIFACT_ROLES = (
+    "01_hive_create_physical",
+    "02_hive_insert",
+    "03_greenplum_create_external",
+    "03_greenplum_create_external_liquibase",
+    "04_greenplum_create_physical",
+    "05_greenplum_insert",
+)
+_ALL_ARTIFACT_ROLES = frozenset(ARTIFACT_ROLES)
 
 
 class _UniqueKeySafeLoader(yaml.SafeLoader):
@@ -67,6 +76,11 @@ class _UniqueKeySafeLoader(yaml.SafeLoader):
 class OutputConfig:
     include_source_comment: bool = True
     filename_separator: str = "__"
+    enabled_artifacts: frozenset[str] = field(default_factory=lambda: _ALL_ARTIFACT_ROLES)
+
+    def artifact_enabled(self, role: str) -> bool:
+        """Return whether one validated artifact role should be emitted."""
+        return role in self.enabled_artifacts
 
 
 @dataclass(frozen=True, slots=True)
@@ -158,6 +172,7 @@ class FactoryConfig:
             "output": {
                 "include_source_comment": self.output.include_source_comment,
                 "filename_separator": self.output.filename_separator,
+                "artifacts": {role: self.output.artifact_enabled(role) for role in ARTIFACT_ROLES},
             },
             "hive": {
                 "target_database": self.hive.target_database,
@@ -221,7 +236,8 @@ def _keys(
     unknown = sorted(set(value) - allowed)
     if unknown:
         raise ConfigurationError(f"{label} contains unknown key: {unknown[0]}")
-    missing = sorted((required or allowed) - set(value))
+    required_keys = allowed if required is None else required
+    missing = sorted(required_keys - set(value))
     if missing:
         raise ConfigurationError(f"{label} is missing required key: {missing[0]}")
 
@@ -330,10 +346,29 @@ def _storage_character(value: object, label: str) -> str:
     return result
 
 
+def _load_output_artifacts(raw_value: object) -> frozenset[str]:
+    label = "output.artifacts"
+    raw = _mapping(raw_value, label)
+    _keys(
+        raw,
+        label=label,
+        allowed=_ALL_ARTIFACT_ROLES,
+        required=frozenset(),
+    )
+    enabled = set(_ALL_ARTIFACT_ROLES)
+    for role, value in raw.items():
+        if not isinstance(value, bool):
+            raise ConfigurationError(f"{label}.{role} must be a boolean")
+        if not value:
+            enabled.remove(role)
+    return frozenset(enabled)
+
+
 def _load_output(raw_value: object) -> OutputConfig:
     raw = _mapping(raw_value, "output")
-    allowed = frozenset({"include_source_comment", "filename_separator"})
-    _keys(raw, label="output", allowed=allowed)
+    allowed = frozenset({"include_source_comment", "filename_separator", "artifacts"})
+    required = frozenset({"include_source_comment", "filename_separator"})
+    _keys(raw, label="output", allowed=allowed, required=required)
     include_source_comment = raw["include_source_comment"]
     if not isinstance(include_source_comment, bool):
         raise ConfigurationError("output.include_source_comment must be a boolean")
@@ -345,6 +380,9 @@ def _load_output(raw_value: object) -> OutputConfig:
     return OutputConfig(
         include_source_comment=include_source_comment,
         filename_separator=separator,
+        enabled_artifacts=(
+            _load_output_artifacts(raw["artifacts"]) if "artifacts" in raw else _ALL_ARTIFACT_ROLES
+        ),
     )
 
 

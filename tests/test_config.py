@@ -7,7 +7,7 @@ from typing import Any
 import pytest
 import yaml
 
-from table_factory.config import FactoryConfig, load_config
+from table_factory.config import ARTIFACT_ROLES, FactoryConfig, load_config
 from table_factory.errors import ConfigurationError
 from table_factory.generator import render_artifacts
 from table_factory.parser import parse_hive_ddl
@@ -17,6 +17,7 @@ VALID_CONFIG: dict[str, Any] = {
     "output": {
         "include_source_comment": True,
         "filename_separator": "__",
+        "artifacts": {role: True for role in ARTIFACT_ROLES},
     },
     "hive": {
         "target_database": "target_hive_db",
@@ -115,6 +116,7 @@ def test_version_3_configuration_loads_all_supported_settings(
     assert config.version == 3
     assert config.output.include_source_comment is True
     assert config.output.filename_separator == "__"
+    assert config.output.enabled_artifacts == frozenset(ARTIFACT_ROLES)
     assert config.hive.target_database == "target_hive_db"
     assert config.hive.replica == "hive_r"
     assert config.hive.physical_table_name_template == "{replica}_{source_table}_physical"
@@ -158,10 +160,68 @@ def test_programmatic_defaults_follow_the_new_location_contract() -> None:
 
     assert config.greenplum.subscription == "subscription"
     assert config.greenplum.original_hive_database == "original_hive_database"
+    assert config.output.enabled_artifacts == frozenset(ARTIFACT_ROLES)
     assert (
         "pxf://prx_subscription_original_hive_database.replica_events_physical"
         "?PROFILE=hive&SERVER=default"
     ) in artifacts[2].content
+
+
+@pytest.mark.parametrize(
+    "artifacts_override",
+    [None, {}],
+    ids=["section-absent", "empty-override"],
+)
+def test_artifact_selection_defaults_every_role_to_enabled(
+    tmp_path: Path,
+    artifacts_override: dict[str, bool] | None,
+) -> None:
+    raw = deepcopy(VALID_CONFIG)
+    if artifacts_override is None:
+        del raw["output"]["artifacts"]
+    else:
+        raw["output"]["artifacts"] = artifacts_override
+
+    config = _load(tmp_path, raw)
+
+    assert config.output.enabled_artifacts == frozenset(ARTIFACT_ROLES)
+    assert config.as_dict()["output"]["artifacts"] == {role: True for role in ARTIFACT_ROLES}
+
+
+@pytest.mark.parametrize("enabled_role", ARTIFACT_ROLES)
+def test_artifact_selection_can_emit_each_role_independently(
+    tmp_path: Path,
+    enabled_role: str,
+) -> None:
+    raw = deepcopy(VALID_CONFIG)
+    raw["output"]["artifacts"] = {role: role == enabled_role for role in ARTIFACT_ROLES}
+    config = _load(tmp_path, raw)
+    table = parse_hive_ddl("CREATE TABLE source_db.events (id BIGINT);")[0]
+
+    artifacts = render_artifacts(table, config=config, source_label="events.sql")
+
+    assert [artifact.filename for artifact in artifacts] == [
+        f"source_db_events__{enabled_role}.sql"
+    ]
+
+
+def test_disabled_liquibase_artifact_is_not_rendered_or_validated(
+    tmp_path: Path,
+) -> None:
+    raw = deepcopy(VALID_CONFIG)
+    raw["output"]["artifacts"] = {
+        "01_hive_create_physical": True,
+        "03_greenplum_create_external_liquibase": False,
+    }
+    raw["greenplum"]["external"]["liquibase"]["changeset_id_template"] = (
+        "{source_database}-{source_table}"
+    )
+    config = _load(tmp_path, raw)
+    table = parse_hive_ddl("CREATE TABLE events (id BIGINT);")[0]
+
+    artifacts = render_artifacts(table, config=config, source_label="events.sql")
+
+    assert all("liquibase" not in artifact.filename for artifact in artifacts)
 
 
 @pytest.mark.parametrize("version", [1, 2], ids=["v1", "v2"])
@@ -257,6 +317,14 @@ def test_configuration_requires_version_3_as_an_integer(
         (
             _changed("output.include_source_comment", 1),
             "output.include_source_comment must be a boolean",
+        ),
+        (
+            _changed("output.artifacts", []),
+            "output.artifacts must be a YAML mapping",
+        ),
+        (
+            _changed("output.artifacts.01_hive_create_physical", 1),
+            "output.artifacts.01_hive_create_physical must be a boolean",
         ),
         (
             _changed("hive.target_database", 7),
@@ -386,6 +454,7 @@ def test_configuration_rejects_missing_required_keys(
     [
         ("", "configuration"),
         ("output", "output"),
+        ("output.artifacts", "output.artifacts"),
         ("hive", "hive"),
         ("hive.storage", "hive.storage"),
         ("greenplum", "greenplum"),

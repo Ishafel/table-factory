@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 from conftest import invoke_cli, parse_json_output
 
+from table_factory.config import ARTIFACT_ROLES
 from table_factory.errors import OutputSafetyError
 from table_factory.generator import Artifact, write_artifacts
 from table_factory.path_safety import has_untrusted_symlink_component
@@ -18,6 +19,19 @@ def _relative(path: Path, root: Path) -> str:
 
 def _generated_sql(output_dir: Path) -> list[Path]:
     return sorted(path for path in output_dir.glob("*.sql") if path.is_file())
+
+
+def _configure_artifacts(config_path: Path, enabled: set[str]) -> None:
+    contents = config_path.read_text(encoding="utf-8")
+    for role in ARTIFACT_ROLES:
+        old = f'    "{role}": true'
+        assert old in contents
+        contents = contents.replace(
+            old,
+            f'    "{role}": {str(role in enabled).lower()}',
+            1,
+        )
+    config_path.write_text(contents, encoding="utf-8")
 
 
 def _assert_no_absolute_workspace_path(text: str, root: Path) -> None:
@@ -123,6 +137,87 @@ def test_generate_is_repeatable_and_does_not_accumulate_outputs(
 
     assert len(first) == 6
     assert second == first
+
+
+def test_disabling_artifacts_does_not_delete_files_from_a_previous_run(
+    cli_case: dict[str, Path],
+) -> None:
+    root = cli_case["root"]
+    arguments = (
+        "generate",
+        "--input",
+        _relative(cli_case["input"], root),
+        "--output",
+        _relative(cli_case["output"], root),
+        "--config",
+        _relative(cli_case["config"], root),
+    )
+    invoke_cli(*arguments, cwd=root)
+    _configure_artifacts(cli_case["config"], {"01_hive_create_physical"})
+
+    result = invoke_cli(*arguments, cwd=root)
+
+    assert "Generated 1 SQL files" in result.stdout
+    assert len(_generated_sql(cli_case["output"])) == 6
+
+
+def test_generate_and_inspect_respect_selective_artifact_config(
+    cli_case: dict[str, Path],
+) -> None:
+    root = cli_case["root"]
+    enabled = {
+        "03_greenplum_create_external_liquibase",
+        "05_greenplum_insert",
+    }
+    _configure_artifacts(cli_case["config"], enabled)
+
+    generated_result = invoke_cli(
+        "generate",
+        "--input",
+        _relative(cli_case["input"], root),
+        "--output",
+        _relative(cli_case["output"], root),
+        "--config",
+        _relative(cli_case["config"], root),
+        cwd=root,
+    )
+    inspected_result = invoke_cli(
+        "inspect",
+        _relative(cli_case["ddl"], root),
+        "--config",
+        _relative(cli_case["config"], root),
+        cwd=root,
+    )
+
+    assert "Generated 2 SQL files" in generated_result.stdout
+    assert [path.name for path in _generated_sql(cli_case["output"])] == [
+        "analytics_customer_orders__03_greenplum_create_external_liquibase.sql",
+        "analytics_customer_orders__05_greenplum_insert.sql",
+    ]
+    effective = parse_json_output(inspected_result)["config"]["output"]["artifacts"]
+    assert effective == {role: role in enabled for role in ARTIFACT_ROLES}
+
+
+def test_generate_allows_every_artifact_to_be_disabled(
+    cli_case: dict[str, Path],
+) -> None:
+    root = cli_case["root"]
+    _configure_artifacts(cli_case["config"], set())
+
+    result = invoke_cli(
+        "generate",
+        "--input",
+        _relative(cli_case["input"], root),
+        "--output",
+        _relative(cli_case["output"], root),
+        "--config",
+        _relative(cli_case["config"], root),
+        cwd=root,
+    )
+
+    assert "Generated 0 SQL files" in result.stdout
+    assert cli_case["output"].is_dir()
+    assert not list(cli_case["output"].iterdir())
 
 
 def test_generate_and_inspect_support_qualified_name_inside_one_backtick_pair(
@@ -492,6 +587,7 @@ def test_inspect_returns_json_and_keeps_host_paths_private(
     document = parse_json_output(result)
     assert isinstance(document, dict)
     assert document["config"]["version"] == 3
+    assert document["config"]["output"]["artifacts"] == {role: True for role in ARTIFACT_ROLES}
     assert document["config"]["hive"]["replica"] == "replica"
     assert document["config"]["greenplum"]["replica"] == "replica"
     assert document["config"]["greenplum"]["subscription"] == "subscription"

@@ -3,6 +3,13 @@ version: 3
 output:
   include_source_comment: true
   filename_separator: "__"
+  artifacts:
+    "01_hive_create_physical": true
+    "02_hive_insert": true
+    "03_greenplum_create_external": true
+    "03_greenplum_create_external_liquibase": true
+    "04_greenplum_create_physical": true
+    "05_greenplum_insert": true
 
 hive:
   target_database: target_hive_db

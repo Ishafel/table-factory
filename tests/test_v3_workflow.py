@@ -10,21 +10,13 @@ from pathlib import Path
 import pytest
 from conftest import invoke_cli
 
+from table_factory.config import ARTIFACT_ROLES
 from table_factory.parser import parse_hive_ddl
 from table_factory.type_mapper import map_hive_type
 
 FIXTURES = Path(__file__).parent / "fixtures"
 LARGE_DDL = FIXTURES / "large_show_create.sql"
 COMMENTS_DDL = FIXTURES / "comments_and_partitions.sql"
-
-ARTIFACT_ROLES = (
-    "01_hive_create_physical",
-    "02_hive_insert",
-    "03_greenplum_create_external",
-    "03_greenplum_create_external_liquibase",
-    "04_greenplum_create_physical",
-    "05_greenplum_insert",
-)
 
 EXPECTED_LARGE_COLUMN_NAMES = tuple(f"column_{index:03d}" for index in range(1, 112))
 
@@ -509,6 +501,50 @@ def test_two_tables_in_one_document_generate_two_complete_role_sets(
     assert tuple(generated) == expected_names
     assert len(generated) == 12
     assert all(content.strip() for content in generated.values())
+
+
+def test_artifact_selection_applies_to_every_table_in_a_document(
+    tmp_path: Path,
+    test_config_path: Path,
+) -> None:
+    enabled = {
+        "01_hive_create_physical",
+        "05_greenplum_insert",
+    }
+    config = _modified_config(
+        test_config_path,
+        tmp_path / "selective.yaml",
+        *(
+            (f'    "{role}": true', f'    "{role}": {str(role in enabled).lower()}')
+            for role in ARTIFACT_ROLES
+        ),
+    )
+    ddl = tmp_path / "two_tables.sql"
+    ddl.write_text(
+        "CREATE TABLE source_db.first_table (id BIGINT);\n"
+        "CREATE TABLE source_db.second_table (id BIGINT);\n",
+        encoding="utf-8",
+    )
+    output_directory = tmp_path / "output"
+
+    result = invoke_cli(
+        "generate",
+        "--input",
+        ddl,
+        "--output",
+        output_directory,
+        "--config",
+        config,
+        cwd=tmp_path,
+    )
+
+    assert "Generated 4 SQL files" in result.stdout
+    assert tuple(_read_artifacts(output_directory)) == tuple(
+        f"{stem}__{role}.sql"
+        for stem in ("source_db_first_table", "source_db_second_table")
+        for role in ARTIFACT_ROLES
+        if role in enabled
+    )
 
 
 def test_case_insensitive_multi_table_target_collision_writes_nothing(

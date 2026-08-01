@@ -6,11 +6,12 @@ import os
 import re
 import tempfile
 import unicodedata
+from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 
-from table_factory.config import FactoryConfig
+from table_factory.config import ARTIFACT_ROLES, FactoryConfig
 from table_factory.errors import OutputSafetyError, TableFactoryError
 from table_factory.greenplum_renderer import (
     render_greenplum_create_external,
@@ -27,14 +28,6 @@ from table_factory.naming import build_target_names
 from table_factory.path_safety import has_untrusted_symlink_component
 from table_factory.type_mapper import map_table_columns
 
-_ARTIFACT_ROLES = (
-    "01_hive_create_physical",
-    "02_hive_insert",
-    "03_greenplum_create_external",
-    "03_greenplum_create_external_liquibase",
-    "04_greenplum_create_physical",
-    "05_greenplum_insert",
-)
 _MAX_STEM_BYTES = 160
 
 
@@ -80,7 +73,7 @@ def render_artifacts(
     config: FactoryConfig,
     source_label: str,
 ) -> tuple[Artifact, ...]:
-    """Render five workflow artifacts plus one alternative Liquibase wrapper."""
+    """Render the configured subset of workflow and Liquibase artifacts."""
     plan = (
         table
         if isinstance(table, TablePlan)
@@ -98,30 +91,31 @@ def render_artifacts(
         if config.include_source_comment
         else ""
     )
-    workflow_statements = (
-        render_hive_create_physical(plan, config=config),
-        render_hive_insert(plan, config=config),
-        render_greenplum_create_external(plan, config=config),
-        render_greenplum_create_physical(plan, config=config),
-        render_greenplum_insert(plan),
-    )
-    liquibase_statement = render_greenplum_create_external_liquibase(plan, config=config)
-    marker, newline, remainder = liquibase_statement.partition("\n")
-    if marker != "--liquibase formatted sql" or not newline:
-        raise AssertionError("Liquibase renderer omitted its required first line")
-    contents = (
-        *(header + statement for statement in workflow_statements[:3]),
-        f"{marker}\n{header}{remainder}",
-        *(header + statement for statement in workflow_statements[3:]),
+
+    def liquibase_content() -> str:
+        statement = render_greenplum_create_external_liquibase(plan, config=config)
+        marker, newline, remainder = statement.partition("\n")
+        if marker != "--liquibase formatted sql" or not newline:
+            raise AssertionError("Liquibase renderer omitted its required first line")
+        return f"{marker}\n{header}{remainder}"
+
+    renderers: tuple[Callable[[], str], ...] = (
+        lambda: header + render_hive_create_physical(plan, config=config),
+        lambda: header + render_hive_insert(plan, config=config),
+        lambda: header + render_greenplum_create_external(plan, config=config),
+        liquibase_content,
+        lambda: header + render_greenplum_create_physical(plan, config=config),
+        lambda: header + render_greenplum_insert(plan),
     )
     stem = _safe_stem(plan.source)
     separator = config.filename_separator
     return tuple(
         Artifact(
             filename=f"{stem}{separator}{role}.sql",
-            content=content,
+            content=renderer(),
         )
-        for role, content in zip(_ARTIFACT_ROLES, contents, strict=True)
+        for role, renderer in zip(ARTIFACT_ROLES, renderers, strict=True)
+        if config.output.artifact_enabled(role)
     )
 
 

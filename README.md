@@ -1,8 +1,9 @@
 # table-factory
 
 `table-factory` — офлайн CLI-утилита, которая преобразует DDL существующей
-Hive-таблицы в пять SQL-скриптов основной цепочки переноса данных и
-дополнительный Liquibase-скрипт создания Greenplum external table.
+Hive-таблицы в настраиваемый набор SQL-файлов шести стабильных ролей. По
+умолчанию включены все шесть ролей, включая Liquibase-файл создания Greenplum
+external table.
 
 Утилита работает только с локальными файлами: разбирает DDL, проверяет
 конфигурацию и генерирует SQL. Она не подключается к Hive, Hadoop, Greenplum
@@ -19,7 +20,8 @@ Hive-таблицы в пять SQL-скриптов основной цепоч
 2. Сохраните результат как UTF-8 SQL-файл в `work/input/`, например
    `work/input/customer_orders.sql`.
 3. Запустите `table-factory generate`.
-4. Получите шесть готовых скриптов в `work/output/`.
+4. Получите включённые в config скрипты в `work/output/` — по умолчанию все
+   шесть.
 5. Передайте скрипты исполнителю целевой среды и выберите один маршрут:
    `01 → 02 → 03 → 04 → 05` для прямого PXF либо
    `03_greenplum_create_external_liquibase → 04 → 05` для Liquibase.
@@ -83,8 +85,8 @@ docker compose run --rm table-factory generate \
 index, если нужных слоёв и пакетов ещё нет в cache. Уже собранный CLI выполняет
 `generate`, `validate` и `inspect` без сетевых обращений.
 
-Для source-таблицы `analytics.customer_orders` и стандартного разделителя `__`
-будут созданы:
+Для source-таблицы `analytics.customer_orders`, стандартного разделителя `__`
+и включённых по умолчанию шести ролей будут созданы:
 
 ```text
 analytics_customer_orders__01_hive_create_physical.sql
@@ -107,7 +109,8 @@ destinations заменяются последовательно. При обы�
 аварийное завершение процесса и отказ самой операции rollback не гарантируют
 восстановление всего набора. Посторонние и устаревшие файлы остаются на месте.
 Используйте новую пустую директорию, если нужно проверить, что для одной
-таблицы результат содержит ровно эти шесть файлов.
+таблицы результат содержит ровно выбранные файлы. В частности, отключение роли
+в config не удаляет её файл, оставшийся от предыдущего запуска.
 
 ## Что принимается на вход
 
@@ -202,11 +205,19 @@ Input может быть одним `.sql`-файлом или директор
 рекурсивно и детерминированно, расширение `.sql` сравнивается без учёта
 регистра. Все документы читаются как UTF-8 и проверяются до начала записи.
 
-## Шесть выходных файлов
+## Выходные файлы
+
+`output.artifacts` глобально выбирает роли, генерируемые для каждой source
+table. Секция необязательна: отсутствующая секция, пустая mapping и пропущенные
+в ней роли означают `true`. Effective config в `inspect` всегда показывает все
+шесть boolean-значений. Флаги управляют только созданием файлов: утилита не
+добавляет зависимости автоматически, не выполняет SQL и не удаляет ранее
+созданные файлы отключённых ролей.
 
 Два файла с номером шага `03` — взаимоисключающие способы создать одну и ту же
 external table. Liquibase-вариант находится рядом с прямым вариантом и до
-шагов `04`–`05` при лексикографической сортировке:
+шагов `04`–`05` при лексикографической сортировке. Каждая строка таблицы
+создаётся только при включённой соответствующей роли:
 
 | № | Роль и имя | Что делает |
 | --- | --- | --- |
@@ -224,17 +235,21 @@ external table. Liquibase-вариант находится рядом с пря
 файлы `01`–`02`. Эти два маршрута нельзя смешивать. Hive-файлы выполняются в
 Hive, Greenplum-файлы — после подключения к `greenplum.database`, а
 Liquibase-файл — через Liquibase. Утилита execution context не переключает.
+Для полного маршрута нужно самостоятельно включить все перечисленные роли.
+Частичный набор допустим, если пропущенные объекты или data steps уже созданы
+либо управляются отдельно; локально проверить это состояние невозможно.
 
 Если `output.filename_separator` изменён, вместо `__` используется заданный
-разделитель; названия ролей и их порядок не меняются.
+разделитель; названия включённых ролей и их порядок не меняются.
 
 Legacy-артефакты `create`, `drop`, `describe`, `show-create` и `analyze` больше
-не генерируются. Единственный `DROP` находится внутри управляемого
-Liquibase-варианта шага 03 и всегда имеет форму `DROP EXTERNAL TABLE IF EXISTS ...
-CASCADE`. Исходный `CREATE TABLE` не копируется.
+не генерируются. Если Liquibase-роль включена, единственный `DROP` находится
+внутри управляемого Liquibase-варианта шага 03 и всегда имеет форму
+`DROP EXTERNAL TABLE IF EXISTS ... CASCADE`. Исходный `CREATE TABLE` не
+копируется.
 
 Скрипты рассчитаны на новые, ещё не существующие targets и не являются
-идемпотентными: все три `CREATE` генерируются без `IF NOT EXISTS`. Если
+идемпотентными: включённые роли `CREATE` генерируются без `IF NOT EXISTS`. Если
 существующие targets сохранить и вручную повторить только DML, Hive
 `INSERT INTO` и Greenplum `INSERT INTO` допишут строки. Hive
 `INSERT OVERWRITE` заменит данные только в Hive target; Greenplum INSERT всё
@@ -360,11 +375,12 @@ ordinary columns в исходном порядке
 → бывшие partition columns в исходном порядке
 ```
 
-Бывшие partition columns становятся обычными физическими колонками. Они
-присутствуют в обоих `CREATE`, Hive `INSERT`, Greenplum external table,
-Liquibase JSON и Greenplum `INSERT`; `PARTITIONED BY` в target отсутствует. Все имена в общем
-списке обычных и partition columns должны быть уникальны после Unicode NFKC
-normalization и сравнения без учёта регистра; коллизия отклоняется до записи.
+Бывшие partition columns становятся обычными физическими колонками. При
+включённых соответствующих ролях они присутствуют в обоих `CREATE`, Hive
+`INSERT`, Greenplum external table, Liquibase JSON и Greenplum `INSERT`;
+`PARTITIONED BY` в target отсутствует. Все имена в общем списке обычных и
+partition columns должны быть уникальны после Unicode NFKC normalization и
+сравнения без учёта регистра; коллизия отклоняется до записи.
 
 Семантические comments переносятся так:
 
@@ -456,9 +472,9 @@ source storage разбирается, но не копируется.
 ## Version 3 config
 
 Путь к YAML-конфигурации обязателен для `generate`, `validate` и `inspect`.
-Автоматического поиска config нет. Все показанные ниже поля обязательны;
-неизвестные, отсутствующие и повторяющиеся mapping keys на любом уровне
-отклоняются.
+Автоматического поиска config нет. Все показанные ниже поля обязательны, кроме
+необязательной partial mapping `output.artifacts`; неизвестные, отсутствующие
+обязательные и повторяющиеся mapping keys на любом уровне отклоняются.
 
 [`config/table-factory.yaml`](config/table-factory.yaml) — пользовательский
 runtime-конфиг и пример для локального запуска. Его можно менять под конкретное
@@ -473,6 +489,13 @@ version: 3
 output:
   include_source_comment: true
   filename_separator: "__"
+  artifacts:
+    "01_hive_create_physical": true
+    "02_hive_insert": true
+    "03_greenplum_create_external": true
+    "03_greenplum_create_external_liquibase": true
+    "04_greenplum_create_physical": true
+    "05_greenplum_insert": true
 
 hive:
   target_database: target_hive_db
@@ -523,6 +546,7 @@ greenplum:
 | `version` | integer, только `3` | Версия несовместимой v3 schema |
 | `output.include_source_comment` | boolean | Добавлять безопасный header с basename source-файла |
 | `output.filename_separator` | string из `.`/`_`/`-`, длина `1..8` | Разделять portable stem и стабильную роль файла |
+| `output.artifacts.<role>` | boolean; необязательный override, effective default `true` | Генерировать файл соответствующей стабильной роли для каждой source table |
 | `hive.target_database` | непустой unqualified identifier | Database новой физической Hive table |
 | `hive.replica` | ASCII fragment `[A-Za-z0-9_][A-Za-z0-9_-]*` | Значение `{replica}` в Hive name template |
 | `hive.physical_table_name_template` | безопасный name template | Имя новой Hive table |
@@ -548,6 +572,14 @@ greenplum:
 | `greenplum.external.liquibase.author` | безопасный ASCII token | Author в `--changeset author:id` |
 | `greenplum.external.liquibase.changeset_id_template` | безопасный changeset template | ID Liquibase changeset для каждой source table |
 | `greenplum.external.liquibase.function_name` | непустой unqualified identifier, не более 63 UTF-8 bytes | Функция создания external table в `greenplum.external_schema` |
+
+Допустимые ключи `output.artifacts` — точные role suffixes из таблицы выходных
+файлов: `01_hive_create_physical`, `02_hive_insert`,
+`03_greenplum_create_external`, `03_greenplum_create_external_liquibase`,
+`04_greenplum_create_physical` и `05_greenplum_insert`. Неуказанные роли
+остаются включёнными; неизвестные ключи и значения не типа boolean
+отклоняются. Все шесть `false` допустимы: `generate` выполняет подготовку,
+создаёт output-директорию и сообщает `Generated 0 SQL files`.
 
 Database и schema, включая `greenplum.original_hive_database`, должны быть
 одиночными identifiers из ASCII letters, digits и underscore, начинаться с
@@ -683,7 +715,8 @@ docker compose run --rm table-factory generate \
 
 Команда выполняет полный parse, semantic validation, type mapping, render и
 collision validation, а затем пишет артефакты. При успехе сообщает число
-созданных SQL-файлов: шесть на таблицу.
+созданных SQL-файлов: число включённых ролей × число source tables. При
+стандартном config это шесть файлов на таблицу.
 
 ### `validate`
 
@@ -708,7 +741,7 @@ docker compose run --rm table-factory inspect \
 `inspect` принимает один SQL-файл и выводит UTF-8 JSON, содержащий:
 
 - безопасный source path label без абсолютного host path;
-- полную effective version 3 config;
+- полную effective version 3 config, включая все шесть artifact-флагов;
 - source database, table, qualified name и `external` flag;
 - отдельные ordinary и partition columns, Hive types и comments;
 - table comment;
@@ -741,9 +774,10 @@ traceback и не раскрывают абсолютные host paths.
   документы. Для одиночного input-файла это ограничение не требуется.
 - Все input-файлы разбираются, target/type mapping и collisions проверяются до
   записи.
-- Полный набор артефактов сначала записывается во временные файлы, затем
-  destinations заменяются последовательными атомарными `os.replace`. Набор в
-  целом не атомарен для параллельного читателя и не является crash-safe.
+- Полный включённый набор артефактов сначала записывается во временные файлы,
+  затем destinations заменяются последовательными атомарными `os.replace`.
+  Набор в целом не атомарен для параллельного читателя и не является
+  crash-safe.
 - При ошибке записи выполняется best-effort rollback, включая попытку
   восстановить существовавшие файлы. Если filesystem отказывает и при
   rollback или cleanup, CLI возвращает контролируемую ошибку без traceback, а
@@ -751,11 +785,14 @@ traceback и не раскрывают абсолютные host paths.
 - SQL headers содержат только безопасный basename источника.
 - Повторная генерация при неизменном наборе реально прочитанных input-файлов и
   том же config побайтово детерминирована.
-- Файлы, не входящие в текущий набор артефактов, не удаляются.
+- Отключённые renderer-ы не вызываются, но общие parse, type/target mapping и
+  collision checks выполняются даже при всех шести `false`.
+- Файлы, не входящие в текущий включённый набор артефактов, не удаляются.
 
-При двух таблицах создаётся двенадцать артефактов, при трёх — восемнадцать.
-Несколько таблиц могут находиться в одном файле или в разных файлах
-рекурсивного input tree.
+Число файлов равно числу включённых ролей, умноженному на число source tables.
+По умолчанию при двух таблицах создаётся двенадцать артефактов, при трёх —
+восемнадцать. Несколько таблиц могут находиться в одном файле или в разных
+файлах рекурсивного input tree.
 
 ## Проверки проекта
 
@@ -857,17 +894,21 @@ wheel-вариант CLI не подключается к target systems.
   Hive profile с `CUSTOM/pxfwritable_import`.
 - Greenplum distribution policy ограничена `DISTRIBUTED RANDOMLY`.
 - Target Hive/Greenplum database и schemas должны существовать заранее.
+- `output.artifacts` не проверяет dependency closure выбранного маршрута:
+  частичный набор безопасен только при заранее подготовленных пропущенных
+  объектах и data steps.
 - PXF/Hive deployment должен заранее публиковать database alias
   `prx_<greenplum.subscription>_<greenplum.original_hive_database>` и
   сопоставлять его с `hive.target_database`; утилита не создаёт и не проверяет
   это сопоставление.
-- Для Liquibase-альтернативы функция
+- Если Liquibase-роль включена и её SQL исполняется, функция
   `greenplum.external.liquibase.function_name` должна существовать в
   `greenplum.external_schema` и принимать документированный JSON-контракт.
   Утилита не подключается к Greenplum и не проверяет функцию или permissions.
-- Liquibase-артефакт содержит `DROP EXTERNAL TABLE IF EXISTS ... CASCADE` и
-  может удалить зависящие от external table объекты. Его следует применять
-  только в контролируемом Liquibase deployment вместо прямого PXF-файла 3.
+- Включённый Liquibase-артефакт содержит
+  `DROP EXTERNAL TABLE IF EXISTS ... CASCADE` и может удалить зависящие от
+  external table объекты. Его следует применять только в контролируемом
+  Liquibase deployment вместо прямого PXF-файла 3.
 - Hive `INSERT INTO` использует target column list; `INSERT OVERWRITE`
   использует детерминированный порядок target DDL и явный source `SELECT`,
   поскольку target column list в этой форме грамматикой Hive не поддерживается.
@@ -883,12 +924,13 @@ wheel-вариант CLI не подключается к target systems.
 - Source modifiers, constraints, partitioning, storage, `LOCATION`, properties,
   clustering, sorting, bucketing и skewing в target не переносятся; переносятся
   только колонки, Hive-типы и семантические table/column comments.
-- Сгенерированные `CREATE` не имеют `IF NOT EXISTS`; Hive `INSERT INTO` и
-  Greenplum INSERT имеют append-семантику. Набор предназначен для
-  контролируемого однократного запуска на свободные target names.
+- Сгенерированные включёнными ролями `CREATE` не имеют `IF NOT EXISTS`; Hive
+  `INSERT INTO` и Greenplum INSERT имеют append-семантику. Набор предназначен
+  для контролируемого однократного запуска на свободные target names.
 - При directory input output не должен совпадать с ним или быть его
   поддиректорией; это ограничение пока не проверяется автоматически.
-- Непустая output-директория не очищается.
+- Непустая output-директория не очищается; отключение artifact-роли не удаляет
+  созданный ею ранее файл.
 
 ## Структура реализации
 
