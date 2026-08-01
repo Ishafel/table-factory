@@ -307,9 +307,9 @@ Hive profile и:
 
 ```sql
 LOCATION (
-  'pxf://prx_subscription_original_hive_database.replica_customer_orders_physical?PROFILE=hive&SERVER=default'
+  E'pxf://prx_subscription_original_hive_database.replica_customer_orders_physical?PROFILE=hive&SERVER=default'
 ) ON ALL
-FORMAT 'CUSTOM' (FORMATTER='pxfwritable_import')
+FORMAT E'CUSTOM' (FORMATTER=E'pxfwritable_import')
 ENCODING 'UTF8';
 ```
 
@@ -395,7 +395,9 @@ partition columns должны быть уникальны после Unicode NF
 Апострофы, Unicode и identifiers экранируются отдельно для каждого диалекта:
 Hive использует backticks, Greenplum — double quotes. Liquibase descriptions
 сначала JSON-encode-ятся, затем весь payload экранируется как Greenplum string
-literal; Unicode сохраняется. NUL в comments отклоняется до генерации.
+literal. Динамические Greenplum strings выводятся как explicit `E'...'`: каждый
+backslash и apostrophe экранируется независимо от `standard_conforming_strings`;
+Unicode сохраняется. NUL в comments отклоняется до генерации.
 Произвольные исходные SQL-комментарии `-- ...` и `/* ... */` не переносятся.
 
 ## Hive → Greenplum type mapping

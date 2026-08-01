@@ -27,9 +27,11 @@ def _liquibase_artifact(ddl: str, config: FactoryConfig | None = None) -> str:
 
 
 def _payload(content: str) -> dict[str, Any]:
-    match = re.search(r"\('(?P<payload>\{.*\})'\);\n\Z", content, re.DOTALL)
+    match = re.search(r"\(E'(?P<payload>\{.*\})'\);\n\Z", content, re.DOTALL)
     assert match is not None
-    value = json.loads(match.group("payload").replace("''", "'"))
+    payload = match.group("payload").replace("''", "'")
+    payload = payload.replace("\\\\", "\\")
+    value = json.loads(payload)
     assert isinstance(value, dict)
     return value
 
@@ -130,20 +132,25 @@ def test_liquibase_payload_maps_every_supported_scalar_type(
 
 def test_liquibase_payload_is_valid_json_inside_a_greenplum_string() -> None:
     expected_description = (
-        "O'Brien \"quoted\" \\path\nline\t'); DROP TABLE victims; -- Кириллица 😀"
+        "O'Brien \"quoted\" \\path\nline\t\\'; DROP TABLE victims; -- Кириллица 😀"
     )
     content = _liquibase_artifact(
         "CREATE TABLE source_db.events ("
         "`owner's` STRING COMMENT "
         "'O\\'Brien \"quoted\" \\\\path\\n"
-        "line\\t\\'); DROP TABLE victims; -- Кириллица 😀', "
+        r"line\t\\\'; DROP TABLE victims; -- Кириллица 😀', "
         "empty_comment STRING COMMENT '', "
         "no_comment STRING"
         ");"
     )
 
     assert '"name": "owner\'\'s"' in content
-    expected_sql_fragment = json.dumps(expected_description, ensure_ascii=False).replace("'", "''")
+    expected_sql_fragment = (
+        json.dumps(expected_description, ensure_ascii=False)
+        .replace("'", "''")
+        .replace("\\", "\\\\")
+    )
+    assert 'SELECT "ext"."f_create_external_table"(E\'' in content
     assert expected_sql_fragment in content
     assert _payload(content)["columns"] == [
         {"name": "owner's", "type": "text", "description": expected_description},

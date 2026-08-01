@@ -87,9 +87,10 @@ def _greenplum_identifier_block(column_names: tuple[str, ...]) -> str:
 
 
 def _liquibase_payload(content: str) -> dict[str, object]:
-    match = re.search(r"\('(?P<payload>\{.*\})'\);\n\Z", content, re.DOTALL)
+    match = re.search(r"\(E'(?P<payload>\{.*\})'\);\n\Z", content, re.DOTALL)
     assert match is not None
-    value = json.loads(match.group("payload").replace("''", "'"))
+    payload = match.group("payload").replace("''", "'").replace("\\\\", "\\")
+    value = json.loads(payload)
     assert isinstance(value, dict)
     return value
 
@@ -207,10 +208,10 @@ def test_large_fixture_generates_workflow_and_liquibase_artifacts_deterministica
     ) in greenplum_external
     assert (
         "LOCATION (\n"
-        "  'pxf://prx_subscription_original_hive_database.replica_large_table_physical"
+        "  E'pxf://prx_subscription_original_hive_database.replica_large_table_physical"
         "?PROFILE=hive&SERVER=default'\n"
         ") ON ALL\n"
-        "FORMAT 'CUSTOM' (FORMATTER='pxfwritable_import')\n"
+        "FORMAT E'CUSTOM' (FORMATTER=E'pxfwritable_import')\n"
         "ENCODING 'UTF8';"
     ) in greenplum_external
     assert "sample_source" not in greenplum_external
@@ -328,22 +329,22 @@ def test_comments_and_partition_columns_are_flattened_and_escaped(
         assert create_sql.index('"amount"') < create_sql.index('"event_day"')
         assert "PARTITIONED BY" not in create_sql
         assert "O\\'Brien" not in create_sql
-        assert "'События команды O''Brien'" in create_sql
-        assert "'O''Brien'" in create_sql
-        assert "'Идентификатор'" in create_sql
-        assert "'День события'" in create_sql
+        assert "E'События команды O''Brien'" in create_sql
+        assert "E'O''Brien'" in create_sql
+        assert "E'Идентификатор'" in create_sql
+        assert "E'День события'" in create_sql
 
     assert (
-        "COMMENT ON TABLE \"ext\".\"replica_events_ext\" IS 'События команды O''Brien';"
+        "COMMENT ON TABLE \"ext\".\"replica_events_ext\" IS E'События команды O''Brien';"
     ) in greenplum_external
     assert (
-        'COMMENT ON COLUMN "ext"."replica_events_ext"."event_day" IS \'День события\';'
+        'COMMENT ON COLUMN "ext"."replica_events_ext"."event_day" IS E\'День события\';'
     ) in greenplum_external
     assert (
-        "COMMENT ON TABLE \"dwh\".\"replica_events\" IS 'События команды O''Brien';"
+        "COMMENT ON TABLE \"dwh\".\"replica_events\" IS E'События команды O''Brien';"
     ) in greenplum_create
     assert (
-        'COMMENT ON COLUMN "dwh"."replica_events"."event_day" IS \'День события\';'
+        'COMMENT ON COLUMN "dwh"."replica_events"."event_day" IS E\'День события\';'
     ) in greenplum_create
     assert (
         "pxf://prx_subscription_original_hive_database.replica_events_physical"

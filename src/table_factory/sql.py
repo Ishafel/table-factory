@@ -45,10 +45,11 @@ def hive_string(value: str) -> str:
 
 
 def greenplum_string(value: str) -> str:
-    """Quote a standard-conforming PostgreSQL/Greenplum string."""
+    """Quote a PostgreSQL/Greenplum string independently of session settings."""
     if "\0" in value:
         raise ValueError("Greenplum string literals cannot contain NUL")
-    return f"'{value.replace(chr(39), chr(39) * 2)}'"
+    escaped = value.replace("\\", "\\\\").replace("'", "''")
+    return f"E'{escaped}'"
 
 
 def hive_qualified(database: str | None, table: str) -> str:
