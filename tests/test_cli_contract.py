@@ -57,7 +57,7 @@ def test_root_owned_system_path_aliases_are_not_treated_as_user_symlinks() -> No
         assert all(not has_untrusted_symlink_component(path / "folders") for path in aliases)
 
 
-def test_generate_resolves_relative_unicode_paths_and_writes_five_files(
+def test_generate_resolves_relative_unicode_paths_and_writes_six_files(
     cli_case: dict[str, Path],
 ) -> None:
     root = cli_case["root"]
@@ -77,17 +77,25 @@ def test_generate_resolves_relative_unicode_paths_and_writes_five_files(
         "analytics_customer_orders__01_hive_create_physical.sql",
         "analytics_customer_orders__02_hive_insert.sql",
         "analytics_customer_orders__03_greenplum_create_external.sql",
+        "analytics_customer_orders__03_greenplum_create_external_liquibase.sql",
         "analytics_customer_orders__04_greenplum_create_physical.sql",
         "analytics_customer_orders__05_greenplum_insert.sql",
     ]
     assert all(path.stat().st_size > 0 for path in generated)
     assert not list(cli_case["output"].rglob("*.tmp"))
-    combined_sql = "\n".join(path.read_text(encoding="utf-8") for path in generated).upper()
-    assert "DROP " not in combined_sql
-    assert "DESCRIBE " not in combined_sql
-    assert "SHOW CREATE" not in combined_sql
-    assert "ANALYZE " not in combined_sql
-    assert "SELECT *" not in combined_sql
+    workflow_sql = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in generated
+        if "03_greenplum_create_external_liquibase" not in path.name
+    ).upper()
+    assert "DROP " not in workflow_sql
+    assert "DESCRIBE " not in workflow_sql
+    assert "SHOW CREATE" not in workflow_sql
+    assert "ANALYZE " not in workflow_sql
+    assert "SELECT *" not in workflow_sql
+    liquibase = generated[3].read_text(encoding="utf-8")
+    assert liquibase.startswith("--liquibase formatted sql\n")
+    assert liquibase.count("DROP EXTERNAL TABLE IF EXISTS") == 1
 
     observable_text = result.stdout + result.stderr
     observable_text += "".join(path.read_text(encoding="utf-8") for path in generated)
@@ -113,8 +121,48 @@ def test_generate_is_repeatable_and_does_not_accumulate_outputs(
     invoke_cli(*arguments, cwd=root)
     second = {path.name: path.read_bytes() for path in _generated_sql(cli_case["output"])}
 
-    assert len(first) == 5
+    assert len(first) == 6
     assert second == first
+
+
+def test_generate_and_inspect_support_qualified_name_inside_one_backtick_pair(
+    cli_case: dict[str, Path],
+) -> None:
+    root = cli_case["root"]
+    cli_case["ddl"].write_text(
+        "CREATE EXTERNAL TABLE `source_db.events` (id BIGINT);\n",
+        encoding="utf-8",
+    )
+
+    invoke_cli(
+        "generate",
+        "--input",
+        _relative(cli_case["input"], root),
+        "--output",
+        _relative(cli_case["output"], root),
+        "--config",
+        _relative(cli_case["config"], root),
+        cwd=root,
+    )
+    inspected = invoke_cli(
+        "inspect",
+        _relative(cli_case["ddl"], root),
+        "--config",
+        _relative(cli_case["config"], root),
+        cwd=root,
+    )
+
+    generated = _generated_sql(cli_case["output"])
+    assert len(generated) == 6
+    assert all(path.name.startswith("source_db_events__") for path in generated)
+    hive_insert = next(path for path in generated if "02_hive_insert" in path.name).read_text(
+        encoding="utf-8"
+    )
+    assert "FROM `source_db`.`events`;" in hive_insert
+    table = parse_json_output(inspected)["tables"][0]
+    assert table["database"] == "source_db"
+    assert table["name"] == "events"
+    assert table["qualified_name"] == "source_db.events"
 
 
 def test_generate_does_not_clean_unrelated_existing_outputs(
@@ -137,7 +185,7 @@ def test_generate_does_not_clean_unrelated_existing_outputs(
     )
 
     assert unrelated.read_text(encoding="utf-8") == "-- user-owned file\n"
-    assert len(_generated_sql(cli_case["output"])) == 6
+    assert len(_generated_sql(cli_case["output"])) == 7
 
 
 def test_generate_rejects_an_artifact_path_that_is_the_input_ddl(
@@ -446,6 +494,8 @@ def test_inspect_returns_json_and_keeps_host_paths_private(
     assert document["config"]["version"] == 3
     assert document["config"]["hive"]["replica"] == "replica"
     assert document["config"]["greenplum"]["replica"] == "replica"
+    assert document["config"]["greenplum"]["subscription"] == "subscription"
+    assert document["config"]["greenplum"]["original_hive_database"] == "original_hive_database"
     table = document["tables"][0]
     assert table["source_path"] == "входные DDL/пример таблицы.sql"
     assert table["qualified_name"] == "analytics.customer_orders"
@@ -526,7 +576,7 @@ def test_table_name_cannot_escape_the_output_directory(
         path.resolve() for path in scan_root.rglob("*") if path.is_file() and not path.is_symlink()
     }
 
-    invoke_cli(
+    result = invoke_cli(
         "generate",
         "--input",
         _relative(cli_case["input"], root),
@@ -538,6 +588,9 @@ def test_table_name_cannot_escape_the_output_directory(
         check=False,
     )
 
+    assert result.returncode == 2
+    assert "table names may contain at most one database qualifier" in result.stderr
+    assert not cli_case["output"].exists()
     output_root = cli_case["output"].resolve()
     new_files = {
         path.resolve()

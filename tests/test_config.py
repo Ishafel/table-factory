@@ -7,7 +7,7 @@ from typing import Any
 import pytest
 import yaml
 
-from table_factory.config import load_config
+from table_factory.config import FactoryConfig, load_config
 from table_factory.errors import ConfigurationError
 from table_factory.generator import render_artifacts
 from table_factory.parser import parse_hive_ddl
@@ -35,6 +35,8 @@ VALID_CONFIG: dict[str, Any] = {
         "external_schema": "ext",
         "physical_schema": "dwh",
         "replica": "gp_r",
+        "subscription": "sub_a",
+        "original_hive_database": "original_hive_db",
         "external_table_name_template": "{replica}_{source_table}_ext",
         "physical_table_name_template": "{replica}_{source_table}",
         "distribution": {
@@ -42,13 +44,19 @@ VALID_CONFIG: dict[str, Any] = {
         },
         "external": {
             "location_template": (
-                "pxf://prx_{replica}_{hive_database}.{hive_table}?PROFILE={profile}&SERVER={server}"
+                "pxf://prx_{subscription}_{original_hive_database}.{hive_table}"
+                "?PROFILE={profile}&SERVER={server}"
             ),
             "profile": "hive",
             "server": "default",
             "format": {
                 "kind": "custom",
                 "formatter": "pxfwritable_import",
+            },
+            "liquibase": {
+                "author": "22643610",
+                "changeset_id_template": "stg-{source_table}_ext",
+                "function_name": "f_create_external_table",
             },
         },
     },
@@ -119,17 +127,41 @@ def test_version_3_configuration_loads_all_supported_settings(
     assert config.greenplum.external_schema == "ext"
     assert config.greenplum.physical_schema == "dwh"
     assert config.greenplum.replica == "gp_r"
+    assert config.greenplum.subscription == "sub_a"
+    assert config.greenplum.original_hive_database == "original_hive_db"
     assert config.greenplum.external_table_name_template == "{replica}_{source_table}_ext"
     assert config.greenplum.physical_table_name_template == "{replica}_{source_table}"
     assert config.greenplum.distribution.mode == "random"
     assert config.greenplum.external.location_template == (
-        "pxf://prx_{replica}_{hive_database}.{hive_table}?PROFILE={profile}&SERVER={server}"
+        "pxf://prx_{subscription}_{original_hive_database}.{hive_table}"
+        "?PROFILE={profile}&SERVER={server}"
     )
     assert config.greenplum.external.profile == "hive"
     assert config.greenplum.external.server == "default"
     assert config.greenplum.external.format.kind == "custom"
     assert config.greenplum.external.format.formatter == "pxfwritable_import"
+    assert config.greenplum.external.liquibase.author == "22643610"
+    assert config.greenplum.external.liquibase.changeset_id_template == "stg-{source_table}_ext"
+    assert config.greenplum.external.liquibase.function_name == "f_create_external_table"
     assert config.as_dict() == VALID_CONFIG
+
+
+def test_programmatic_defaults_follow_the_new_location_contract() -> None:
+    config = FactoryConfig()
+    table = parse_hive_ddl("CREATE TABLE source_db.events (id BIGINT);")[0]
+
+    artifacts = render_artifacts(
+        table,
+        config=config,
+        source_label="events.sql",
+    )
+
+    assert config.greenplum.subscription == "subscription"
+    assert config.greenplum.original_hive_database == "original_hive_database"
+    assert (
+        "pxf://prx_subscription_original_hive_database.replica_events_physical"
+        "?PROFILE=hive&SERVER=default"
+    ) in artifacts[2].content
 
 
 @pytest.mark.parametrize("version", [1, 2], ids=["v1", "v2"])
@@ -243,12 +275,28 @@ def test_configuration_requires_version_3_as_an_integer(
             "greenplum.replica must be a string",
         ),
         (
+            _changed("greenplum.subscription", 7),
+            "greenplum.subscription must be a string",
+        ),
+        (
+            _changed("greenplum.original_hive_database", None),
+            "greenplum.original_hive_database must be a string",
+        ),
+        (
             _changed("greenplum.distribution.mode", False),
             "greenplum.distribution.mode must be a string",
         ),
         (
             _changed("greenplum.external.format", "custom"),
             "greenplum.external.format must be a YAML mapping",
+        ),
+        (
+            _changed("greenplum.external.liquibase", "changeset"),
+            "greenplum.external.liquibase must be a YAML mapping",
+        ),
+        (
+            _changed("greenplum.external.liquibase.author", 22643610),
+            "greenplum.external.liquibase.author must be a string",
         ),
     ],
 )
@@ -291,6 +339,14 @@ def test_configuration_rejects_wrong_value_types(
             "greenplum is missing required key: replica",
         ),
         (
+            "greenplum.subscription",
+            "greenplum is missing required key: subscription",
+        ),
+        (
+            "greenplum.original_hive_database",
+            "greenplum is missing required key: original_hive_database",
+        ),
+        (
             "greenplum.distribution.mode",
             "greenplum.distribution is missing required key: mode",
         ),
@@ -301,6 +357,18 @@ def test_configuration_rejects_wrong_value_types(
         (
             "greenplum.external.format.formatter",
             "greenplum.external.format is missing required key: formatter",
+        ),
+        (
+            "greenplum.external.liquibase.author",
+            "greenplum.external.liquibase is missing required key: author",
+        ),
+        (
+            "greenplum.external.liquibase.changeset_id_template",
+            "greenplum.external.liquibase is missing required key: changeset_id_template",
+        ),
+        (
+            "greenplum.external.liquibase.function_name",
+            "greenplum.external.liquibase is missing required key: function_name",
         ),
     ],
 )
@@ -324,6 +392,7 @@ def test_configuration_rejects_missing_required_keys(
         ("greenplum.distribution", "greenplum.distribution"),
         ("greenplum.external", "greenplum.external"),
         ("greenplum.external.format", "greenplum.external.format"),
+        ("greenplum.external.liquibase", "greenplum.external.liquibase"),
     ],
 )
 def test_configuration_rejects_unknown_keys_at_every_level(
@@ -342,9 +411,11 @@ def test_configuration_rejects_unknown_keys_at_every_level(
     "path",
     [
         "hive.target_database",
+        "greenplum.original_hive_database",
         "greenplum.database",
         "greenplum.external_schema",
         "greenplum.physical_schema",
+        "greenplum.external.liquibase.function_name",
     ],
 )
 def test_configuration_rejects_empty_namespaces(
@@ -362,9 +433,11 @@ def test_configuration_rejects_empty_namespaces(
     ("path", "value"),
     [
         ("hive.target_database", "target.analytics"),
+        ("greenplum.original_hive_database", "original.database"),
         ("greenplum.database", "warehouse-prod"),
         ("greenplum.external_schema", "ext;DROP_SCHEMA"),
         ("greenplum.physical_schema", "dwh schema"),
+        ("greenplum.external.liquibase.function_name", "admin.create_external"),
     ],
 )
 def test_configuration_rejects_invalid_qualified_names(
@@ -385,6 +458,7 @@ def test_configuration_rejects_invalid_qualified_names(
         "greenplum.database",
         "greenplum.external_schema",
         "greenplum.physical_schema",
+        "greenplum.external.liquibase.function_name",
     ],
 )
 def test_greenplum_namespaces_reject_more_than_63_utf8_bytes(
@@ -407,21 +481,31 @@ def test_greenplum_namespaces_reject_more_than_63_utf8_bytes(
         ("greenplum.replica", "9"),
         ("greenplum.replica", "_gp"),
         ("greenplum.replica", "gp-replica_01"),
+        ("greenplum.subscription", "7"),
+        ("greenplum.subscription", "_sub"),
+        ("greenplum.subscription", "sub-name_01"),
     ],
 )
-def test_replica_fragments_accept_supported_ascii_identifiers(
+def test_ascii_identifier_fragments_accept_supported_values(
     tmp_path: Path,
     path: str,
     value: str,
 ) -> None:
     config = _load(tmp_path, _changed(path, value))
 
-    section = config.hive if path.startswith("hive.") else config.greenplum
-    assert section.replica == value
+    if path == "hive.replica":
+        assert config.hive.replica == value
+    elif path == "greenplum.replica":
+        assert config.greenplum.replica == value
+    else:
+        assert config.greenplum.subscription == value
 
 
-@pytest.mark.parametrize("path", ["hive.replica", "greenplum.replica"])
-def test_replica_fragments_reject_empty_values(
+@pytest.mark.parametrize(
+    "path",
+    ["hive.replica", "greenplum.replica", "greenplum.subscription"],
+)
+def test_ascii_identifier_fragments_reject_empty_values(
     tmp_path: Path,
     path: str,
 ) -> None:
@@ -442,9 +526,12 @@ def test_replica_fragments_reject_empty_values(
         ("greenplum.replica", "-gp"),
         ("greenplum.replica", "gp/replica"),
         ("greenplum.replica", "réplica"),
+        ("greenplum.subscription", "-sub"),
+        ("greenplum.subscription", "sub.name"),
+        ("greenplum.subscription", "подписка"),
     ],
 )
-def test_replica_fragments_reject_unsafe_values(
+def test_ascii_identifier_fragments_reject_unsafe_values(
     tmp_path: Path,
     path: str,
     value: str,
@@ -459,7 +546,7 @@ def test_replica_fragments_reject_unsafe_values(
         _load(tmp_path, _changed(path, value))
 
 
-def test_replica_placeholders_resolve_from_their_own_sections(
+def test_naming_and_location_placeholders_resolve_from_their_own_fields(
     tmp_path: Path,
 ) -> None:
     config = _load(tmp_path, VALID_CONFIG)
@@ -474,9 +561,9 @@ def test_replica_placeholders_resolve_from_their_own_sections(
     assert "CREATE TABLE `target_hive_db`.`hive_r_events_physical`" in artifacts[0].content
     assert 'CREATE EXTERNAL TABLE "ext"."gp_r_events_ext"' in artifacts[2].content
     assert (
-        "pxf://prx_gp_r_target_hive_db.hive_r_events_physical?PROFILE=hive&SERVER=default"
+        "pxf://prx_sub_a_original_hive_db.hive_r_events_physical?PROFILE=hive&SERVER=default"
     ) in artifacts[2].content
-    assert 'CREATE TABLE "dwh"."gp_r_events"' in artifacts[3].content
+    assert 'CREATE TABLE "dwh"."gp_r_events"' in artifacts[4].content
 
 
 @pytest.mark.parametrize(
@@ -498,25 +585,49 @@ def test_name_templates_reject_unknown_placeholders(
         _load(tmp_path, _changed(path, "{tenant}_{source_table}"))
 
 
+def test_changeset_id_template_rejects_unknown_placeholders(tmp_path: Path) -> None:
+    path = "greenplum.external.liquibase.changeset_id_template"
+
+    with pytest.raises(
+        ConfigurationError,
+        match=rf"{path} contains unknown placeholder: subscription",
+    ):
+        _load(tmp_path, _changed(path, "stg-{subscription}-{source_table}"))
+
+
 @pytest.mark.parametrize(
     ("value", "message"),
     [
         (
-            "pxf://prx_{replica}_{hive_database}.{hive_table}"
+            "pxf://prx_{subscription}_{original_hive_database}.{hive_table}"
             "?PROFILE={profile}&SERVER={server}&USER={user}",
             "contains unknown placeholder: user",
         ),
         (
-            "pxf://prx_{replica}_{hive_database}.{hive_table}?PROFILE={profile}",
+            "pxf://prx_{subscription}_{original_hive_database}.{hive_table}?PROFILE={profile}",
             "is missing required placeholder: server",
         ),
         (
-            "pxf://prx_{hive_database}.{hive_table}?PROFILE={profile}&SERVER={server}",
-            "is missing required placeholder: replica",
+            "pxf://prx_{original_hive_database}.{hive_table}?PROFILE={profile}&SERVER={server}",
+            "is missing required placeholder: subscription",
         ),
         (
-            "https://prx_{replica}_{hive_database}.{hive_table}?PROFILE={profile}&SERVER={server}",
+            "pxf://prx_{subscription}_{hive_table}?PROFILE={profile}&SERVER={server}",
+            "is missing required placeholder: original_hive_database",
+        ),
+        (
+            "https://prx_{subscription}_{original_hive_database}.{hive_table}"
+            "?PROFILE={profile}&SERVER={server}",
             "must start with 'pxf://'",
+        ),
+        (
+            "pxf://prx_{replica}_{hive_database}.{hive_table}?PROFILE={profile}&SERVER={server}",
+            "contains unknown placeholder: replica",
+        ),
+        (
+            "pxf://prx_{subscription}_{hive_database}.{hive_table}"
+            "?PROFILE={profile}&SERVER={server}",
+            "contains unknown placeholder: hive_database",
         ),
     ],
 )
@@ -538,13 +649,18 @@ def test_location_template_enforces_its_placeholder_contract(
 @pytest.mark.parametrize(
     "value",
     [
-        "pxf://prx_{replica}_{hive_table}.{hive_database}?PROFILE={profile}&SERVER={server}",
-        "pxf://{replica}_{hive_database}.{hive_table}?PROFILE={profile}&SERVER={server}",
-        "pxf://prx_{replica}_{hive_database}.{hive_table}"
+        "pxf://prx_{subscription}_{hive_table}.{original_hive_database}"
+        "?PROFILE={profile}&SERVER={server}",
+        "pxf://{subscription}_{original_hive_database}.{hive_table}"
+        "?PROFILE={profile}&SERVER={server}",
+        "pxf://prx_{subscription}_{original_hive_database}.{hive_table}"
         "?PROFILE={profile}&SERVER={server}&PASSWORD=secret",
-        "pxf://prx_{replica}_{hive_database}/{hive_table}?PROFILE={profile}&SERVER={server}",
-        "pxf://prx_{replica}_{hive_database}.{hive_table}?PROFILE={server}&SERVER={profile}",
-        "pxf://prx_{replica}_{hive_database}.{hive_table}?profile={profile}&SERVER={server}",
+        "pxf://prx_{subscription}_{original_hive_database}/{hive_table}"
+        "?PROFILE={profile}&SERVER={server}",
+        "pxf://prx_{subscription}_{original_hive_database}.{hive_table}"
+        "?PROFILE={server}&SERVER={profile}",
+        "pxf://prx_{subscription}_{original_hive_database}.{hive_table}"
+        "?profile={profile}&SERVER={server}",
     ],
 )
 def test_location_template_rejects_semantic_variants(
@@ -555,7 +671,8 @@ def test_location_template_rejects_semantic_variants(
         ConfigurationError,
         match=(
             r"greenplum.external.location_template must use "
-            r"'pxf://prx_\{replica\}_\{hive_database\}\.\{hive_table\}' and only "
+            r"'pxf://prx_\{subscription\}_\{original_hive_database\}\.\{hive_table\}' "
+            r"and only "
             r"PROFILE=\{profile\} and SERVER=\{server\} query parameters"
         ),
     ):
@@ -568,13 +685,16 @@ def test_location_template_rejects_semantic_variants(
 def test_location_template_rejects_escaped_required_braces(
     tmp_path: Path,
 ) -> None:
-    value = "pxf://prx_{replica}_{{hive_database}}.{hive_table}?PROFILE={profile}&SERVER={server}"
+    value = (
+        "pxf://prx_{subscription}_{{original_hive_database}}.{hive_table}"
+        "?PROFILE={profile}&SERVER={server}"
+    )
 
     with pytest.raises(
         ConfigurationError,
         match=(
             r"greenplum.external.location_template "
-            r"is missing required placeholder: hive_database"
+            r"is missing required placeholder: original_hive_database"
         ),
     ):
         _load(
@@ -586,7 +706,10 @@ def test_location_template_rejects_escaped_required_braces(
 def test_location_template_accepts_profile_and_server_in_reversed_order(
     tmp_path: Path,
 ) -> None:
-    value = "pxf://prx_{replica}_{hive_database}.{hive_table}?SERVER={server}&PROFILE={profile}"
+    value = (
+        "pxf://prx_{subscription}_{original_hive_database}.{hive_table}"
+        "?SERVER={server}&PROFILE={profile}"
+    )
 
     config = _load(
         tmp_path,
@@ -594,6 +717,15 @@ def test_location_template_accepts_profile_and_server_in_reversed_order(
     )
 
     assert config.greenplum.external.location_template == value
+    table = parse_hive_ddl("CREATE TABLE source_db.events (id BIGINT);")[0]
+    artifacts = render_artifacts(
+        table,
+        config=config,
+        source_label="events.sql",
+    )
+    assert (
+        "pxf://prx_sub_a_original_hive_db.hive_r_events_physical?SERVER=default&PROFILE=hive"
+    ) in artifacts[2].content
 
 
 @pytest.mark.parametrize(
@@ -616,8 +748,14 @@ def test_location_template_accepts_profile_and_server_in_reversed_order(
         ),
         (
             "greenplum.external.location_template",
-            "pxf://prx_{replica}_{hive_database}.{hive_table}'?PROFILE={profile}&SERVER={server}",
+            "pxf://prx_{subscription}_{original_hive_database}.{hive_table}'"
+            "?PROFILE={profile}&SERVER={server}",
             "contains unsafe URI characters",
+        ),
+        (
+            "greenplum.external.liquibase.changeset_id_template",
+            "stg {source_table}",
+            "contains unsafe literal characters",
         ),
     ],
 )
@@ -681,6 +819,26 @@ def test_supported_external_profile_is_rendered_in_canonical_lowercase(
     )
 
     assert config.greenplum.external.profile == "hive"
+
+
+@pytest.mark.parametrize(
+    ("author", "message"),
+    [
+        ("", "must not be empty"),
+        ("22643610:override", "contains unsafe characters"),
+        ("author value", "contains unsafe characters"),
+        ("bad\noption", "must not contain control characters"),
+    ],
+)
+def test_liquibase_author_rejects_empty_or_unsafe_values(
+    tmp_path: Path,
+    author: str,
+    message: str,
+) -> None:
+    path = "greenplum.external.liquibase.author"
+
+    with pytest.raises(ConfigurationError, match=rf"{path} {message}"):
+        _load(tmp_path, _changed(path, author))
 
 
 @pytest.mark.parametrize(

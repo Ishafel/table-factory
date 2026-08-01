@@ -170,7 +170,7 @@ def test_documented_quality_commands_run_inside_the_container() -> None:
         )
 
 
-def test_compose_cli_generates_five_persistent_host_owned_files(
+def test_compose_cli_generates_six_persistent_host_owned_files(
     mounted_case: dict[str, Path],
 ) -> None:
     result = _compose(
@@ -192,6 +192,7 @@ def test_compose_cli_generates_five_persistent_host_owned_files(
         "analytics_customer_orders__01_hive_create_physical.sql",
         "analytics_customer_orders__02_hive_insert.sql",
         "analytics_customer_orders__03_greenplum_create_external.sql",
+        "analytics_customer_orders__03_greenplum_create_external_liquibase.sql",
         "analytics_customer_orders__04_greenplum_create_physical.sql",
         "analytics_customer_orders__05_greenplum_insert.sql",
     ]

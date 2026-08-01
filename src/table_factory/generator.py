@@ -21,6 +21,7 @@ from table_factory.hive_renderer import (
     render_hive_create_physical,
     render_hive_insert,
 )
+from table_factory.liquibase_renderer import render_greenplum_create_external_liquibase
 from table_factory.models import Table, TablePlan
 from table_factory.naming import build_target_names
 from table_factory.path_safety import has_untrusted_symlink_component
@@ -30,6 +31,7 @@ _ARTIFACT_ROLES = (
     "01_hive_create_physical",
     "02_hive_insert",
     "03_greenplum_create_external",
+    "03_greenplum_create_external_liquibase",
     "04_greenplum_create_physical",
     "05_greenplum_insert",
 )
@@ -78,7 +80,7 @@ def render_artifacts(
     config: FactoryConfig,
     source_label: str,
 ) -> tuple[Artifact, ...]:
-    """Render exactly five source-to-target workflow artifacts."""
+    """Render five workflow artifacts plus one alternative Liquibase wrapper."""
     plan = (
         table
         if isinstance(table, TablePlan)
@@ -96,21 +98,30 @@ def render_artifacts(
         if config.include_source_comment
         else ""
     )
-    statements = (
+    workflow_statements = (
         render_hive_create_physical(plan, config=config),
         render_hive_insert(plan, config=config),
         render_greenplum_create_external(plan, config=config),
         render_greenplum_create_physical(plan, config=config),
         render_greenplum_insert(plan),
     )
+    liquibase_statement = render_greenplum_create_external_liquibase(plan, config=config)
+    marker, newline, remainder = liquibase_statement.partition("\n")
+    if marker != "--liquibase formatted sql" or not newline:
+        raise AssertionError("Liquibase renderer omitted its required first line")
+    contents = (
+        *(header + statement for statement in workflow_statements[:3]),
+        f"{marker}\n{header}{remainder}",
+        *(header + statement for statement in workflow_statements[3:]),
+    )
     stem = _safe_stem(plan.source)
     separator = config.filename_separator
     return tuple(
         Artifact(
             filename=f"{stem}{separator}{role}.sql",
-            content=header + statement,
+            content=content,
         )
-        for role, statement in zip(_ARTIFACT_ROLES, statements, strict=True)
+        for role, content in zip(_ARTIFACT_ROLES, contents, strict=True)
     )
 
 

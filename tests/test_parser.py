@@ -44,12 +44,62 @@ def test_non_hive_identifier_quoting_and_characters_are_rejected(ddl: str) -> No
         parse_hive_ddl(ddl)
 
 
-def test_dot_inside_quoted_identifier_is_not_a_database_separator() -> None:
+def test_qualified_table_name_inside_one_backtick_pair_is_supported() -> None:
     table = parse_hive_ddl("CREATE TABLE `sales.daily` (`order.id` BIGINT);")[0]
 
-    assert table.database is None
-    assert table.name == "sales.daily"
+    assert table.database == "sales"
+    assert table.name == "daily"
     assert table.columns[0].name == "order.id"
+
+
+def test_single_backtick_qualified_name_renders_as_two_source_identifiers() -> None:
+    table = parse_hive_ddl("CREATE TABLE `sales.daily` (id BIGINT);")[0]
+
+    artifacts = render_artifacts(
+        table,
+        config=FactoryConfig(),
+        source_label="daily.sql",
+    )
+
+    assert "FROM `sales`.`daily`;" in artifacts[1].content
+
+
+def test_quoted_qualified_table_name_unescapes_each_resulting_part() -> None:
+    table = parse_hive_ddl("CREATE TABLE `sales``archive.daily``events` (`order``id` BIGINT);")[0]
+
+    assert table.database == "sales`archive"
+    assert table.name == "daily`events"
+    assert table.columns[0].name == "order`id"
+
+
+@pytest.mark.parametrize(
+    "name",
+    (
+        "`database.schema.table`",
+        "`database..table`",
+        "`database.`",
+        "`.table`",
+    ),
+)
+def test_malformed_qualified_table_name_inside_backticks_is_rejected(name: str) -> None:
+    with pytest.raises(DdlParseError):
+        parse_hive_ddl(f"CREATE TABLE {name} (id BIGINT);")
+
+
+@pytest.mark.parametrize(
+    "name",
+    (
+        "database.table",
+        "`database`.`table`",
+        "database.`table`",
+        "`database`.table",
+    ),
+)
+def test_existing_qualified_table_name_forms_remain_supported(name: str) -> None:
+    table = parse_hive_ddl(f"CREATE TABLE {name} (id BIGINT);")[0]
+
+    assert table.database == "database"
+    assert table.name == "table"
 
 
 def test_doubled_identifier_quotes_are_unescaped() -> None:

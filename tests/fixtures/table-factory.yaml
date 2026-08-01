@@ -20,14 +20,20 @@ greenplum:
   external_schema: ext
   physical_schema: dwh
   replica: replica
+  subscription: subscription
+  original_hive_database: original_hive_database
   external_table_name_template: "{replica}_{source_table}_ext"
   physical_table_name_template: "{replica}_{source_table}"
   distribution:
     mode: random
   external:
-    location_template: "pxf://prx_{replica}_{hive_database}.{hive_table}?PROFILE={profile}&SERVER={server}"
+    location_template: "pxf://prx_{subscription}_{original_hive_database}.{hive_table}?PROFILE={profile}&SERVER={server}"
     profile: hive
     server: default
     format:
       kind: custom
       formatter: pxfwritable_import
+    liquibase:
+      author: "22643610"
+      changeset_id_template: "stg-{source_table}_ext"
+      function_name: f_create_external_table

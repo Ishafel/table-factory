@@ -17,11 +17,17 @@ from table_factory.errors import ConfigurationError
 
 _SQL_NAMESPACE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 _SAFE_TOKEN = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]*\Z")
-_SAFE_REPLICA = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_-]*\Z")
+_SAFE_IDENTIFIER_FRAGMENT = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_-]*\Z")
 _SAFE_TEMPLATE_LITERAL = re.compile(r"[A-Za-z0-9_]*\Z")
+_SAFE_CHANGESET_LITERAL = re.compile(r"[A-Za-z0-9_.-]*\Z")
 _SAFE_LOCATION = re.compile(r"[A-Za-z0-9:/?&=._%+{}-]+\Z")
 _NAME_PLACEHOLDERS = frozenset({"replica", "source_database", "source_table"})
-_LOCATION_PLACEHOLDERS = frozenset({"replica", "hive_database", "hive_table", "profile", "server"})
+_CHANGESET_PLACEHOLDERS = frozenset(
+    {"replica", "source_database", "source_table", "external_table"}
+)
+_LOCATION_PLACEHOLDERS = frozenset(
+    {"subscription", "original_hive_database", "hive_table", "profile", "server"}
+)
 _GREENPLUM_IDENTIFIER_BYTES = 63
 _CONFIG_VERSION = 3
 _LEGACY_CONFIG_VERSIONS = frozenset({1, 2})
@@ -92,13 +98,24 @@ class GreenplumExternalFormatConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class GreenplumExternalLiquibaseConfig:
+    author: str = "22643610"
+    changeset_id_template: str = "stg-{source_table}_ext"
+    function_name: str = "f_create_external_table"
+
+
+@dataclass(frozen=True, slots=True)
 class GreenplumExternalConfig:
     location_template: str = (
-        "pxf://prx_{replica}_{hive_database}.{hive_table}?PROFILE={profile}&SERVER={server}"
+        "pxf://prx_{subscription}_{original_hive_database}.{hive_table}"
+        "?PROFILE={profile}&SERVER={server}"
     )
     profile: str = "hive"
     server: str = "default"
     format: GreenplumExternalFormatConfig = field(default_factory=GreenplumExternalFormatConfig)
+    liquibase: GreenplumExternalLiquibaseConfig = field(
+        default_factory=GreenplumExternalLiquibaseConfig
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -107,6 +124,8 @@ class GreenplumConfig:
     external_schema: str = "ext"
     physical_schema: str = "dwh"
     replica: str = "replica"
+    subscription: str = "subscription"
+    original_hive_database: str = "original_hive_database"
     external_table_name_template: str = "{replica}_{source_table}_ext"
     physical_table_name_template: str = "{replica}_{source_table}"
     distribution: GreenplumDistributionConfig = field(default_factory=GreenplumDistributionConfig)
@@ -157,6 +176,8 @@ class FactoryConfig:
                 "external_schema": self.greenplum.external_schema,
                 "physical_schema": self.greenplum.physical_schema,
                 "replica": self.greenplum.replica,
+                "subscription": self.greenplum.subscription,
+                "original_hive_database": self.greenplum.original_hive_database,
                 "external_table_name_template": (self.greenplum.external_table_name_template),
                 "physical_table_name_template": (self.greenplum.physical_table_name_template),
                 "distribution": {
@@ -169,6 +190,13 @@ class FactoryConfig:
                     "format": {
                         "kind": self.greenplum.external.format.kind,
                         "formatter": self.greenplum.external.format.formatter,
+                    },
+                    "liquibase": {
+                        "author": self.greenplum.external.liquibase.author,
+                        "changeset_id_template": (
+                            self.greenplum.external.liquibase.changeset_id_template
+                        ),
+                        "function_name": self.greenplum.external.liquibase.function_name,
                     },
                 },
             },
@@ -224,9 +252,9 @@ def _namespace(
     return result
 
 
-def _replica(value: object, label: str) -> str:
+def _ascii_identifier_fragment(value: object, label: str) -> str:
     result = _string_value(value, label)
-    if _SAFE_REPLICA.fullmatch(result) is None:
+    if _SAFE_IDENTIFIER_FRAGMENT.fullmatch(result) is None:
         raise ConfigurationError(
             f"{label} must be an ASCII identifier fragment starting with a letter, "
             "digit or underscore and containing only letters, digits, underscores and hyphens"
@@ -269,6 +297,18 @@ def _name_template(value: object, label: str) -> str:
     )
     if not result.replace("{source_database}", "db").replace("{source_table}", "table"):
         raise ConfigurationError(f"{label} must produce a non-empty table name")
+    return result
+
+
+def _changeset_id_template(value: object) -> str:
+    label = "greenplum.external.liquibase.changeset_id_template"
+    result = _string_value(value, label)
+    _template_fields(
+        result,
+        label=label,
+        allowed=_CHANGESET_PLACEHOLDERS,
+        literal_pattern=_SAFE_CHANGESET_LITERAL,
+    )
     return result
 
 
@@ -370,7 +410,7 @@ def _load_hive(raw_value: object) -> HiveConfig:
         raise ConfigurationError("hive.insert_mode must be 'into' or 'overwrite'")
     return HiveConfig(
         target_database=_namespace(raw["target_database"], "hive.target_database"),
-        replica=_replica(raw["replica"], "hive.replica"),
+        replica=_ascii_identifier_fragment(raw["replica"], "hive.replica"),
         physical_table_name_template=_name_template(
             raw["physical_table_name_template"],
             "hive.physical_table_name_template",
@@ -403,6 +443,25 @@ def _load_external_format(raw_value: object) -> GreenplumExternalFormatConfig:
     return GreenplumExternalFormatConfig(kind=kind, formatter=formatter)
 
 
+def _load_external_liquibase(raw_value: object) -> GreenplumExternalLiquibaseConfig:
+    label = "greenplum.external.liquibase"
+    raw = _mapping(raw_value, label)
+    allowed = frozenset({"author", "changeset_id_template", "function_name"})
+    _keys(raw, label=label, allowed=allowed)
+    author = _string_value(raw["author"], f"{label}.author")
+    if _SAFE_TOKEN.fullmatch(author) is None:
+        raise ConfigurationError(f"{label}.author contains unsafe characters")
+    return GreenplumExternalLiquibaseConfig(
+        author=author,
+        changeset_id_template=_changeset_id_template(raw["changeset_id_template"]),
+        function_name=_namespace(
+            raw["function_name"],
+            f"{label}.function_name",
+            max_utf8_bytes=_GREENPLUM_IDENTIFIER_BYTES,
+        ),
+    )
+
+
 def _location_template(value: object) -> str:
     label = "greenplum.external.location_template"
     result = _string_value(value, label)
@@ -420,7 +479,7 @@ def _location_template(value: object) -> str:
     if not result.lower().startswith("pxf://"):
         raise ConfigurationError(f"{label} must start with 'pxf://'")
     resource, separator, query = result.partition("?")
-    expected_resource = "pxf://prx_{replica}_{hive_database}.{hive_table}"
+    expected_resource = "pxf://prx_{subscription}_{original_hive_database}.{hive_table}"
     expected_parameters = {
         "PROFILE={profile}",
         "SERVER={server}",
@@ -440,7 +499,7 @@ def _location_template(value: object) -> str:
 
 def _load_external(raw_value: object) -> GreenplumExternalConfig:
     raw = _mapping(raw_value, "greenplum.external")
-    allowed = frozenset({"location_template", "profile", "server", "format"})
+    allowed = frozenset({"location_template", "profile", "server", "format", "liquibase"})
     _keys(raw, label="greenplum.external", allowed=allowed)
     requested_profile = _string_value(raw["profile"], "greenplum.external.profile")
     server = _string_value(raw["server"], "greenplum.external.server")
@@ -458,6 +517,7 @@ def _load_external(raw_value: object) -> GreenplumExternalConfig:
         profile=profile,
         server=server,
         format=_load_external_format(raw["format"]),
+        liquibase=_load_external_liquibase(raw["liquibase"]),
     )
 
 
@@ -469,6 +529,8 @@ def _load_greenplum(raw_value: object) -> GreenplumConfig:
             "external_schema",
             "physical_schema",
             "replica",
+            "subscription",
+            "original_hive_database",
             "external_table_name_template",
             "physical_table_name_template",
             "distribution",
@@ -492,7 +554,15 @@ def _load_greenplum(raw_value: object) -> GreenplumConfig:
             "greenplum.physical_schema",
             max_utf8_bytes=_GREENPLUM_IDENTIFIER_BYTES,
         ),
-        replica=_replica(raw["replica"], "greenplum.replica"),
+        replica=_ascii_identifier_fragment(raw["replica"], "greenplum.replica"),
+        subscription=_ascii_identifier_fragment(
+            raw["subscription"],
+            "greenplum.subscription",
+        ),
+        original_hive_database=_namespace(
+            raw["original_hive_database"],
+            "greenplum.original_hive_database",
+        ),
         external_table_name_template=_name_template(
             raw["external_table_name_template"],
             "greenplum.external_table_name_template",

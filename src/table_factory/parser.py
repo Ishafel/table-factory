@@ -814,7 +814,21 @@ def _qualified_name(raw_name: str) -> tuple[str | None, str]:
         index += 1
     parts.append(raw_name[start:].strip())
     if len(parts) == 1:
-        return None, _unquote(parts[0])
+        raw_part = parts[0]
+        name = _unquote(raw_part)
+        if not (len(raw_part) >= 2 and raw_part[0] == raw_part[-1] == "`"):
+            return None, name
+        embedded_parts = name.split(".")
+        if len(embedded_parts) == 1:
+            return None, name
+        if len(embedded_parts) == 2:
+            database, table = embedded_parts
+            if not database or not table:
+                raise DdlParseError(
+                    "a quoted qualified table name must contain both database and table"
+                )
+            return database, table
+        raise DdlParseError("table names may contain at most one database qualifier")
     if len(parts) == 2:
         return _unquote(parts[0]), _unquote(parts[1])
     raise DdlParseError("table names may contain at most one database qualifier")
