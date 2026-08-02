@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import codecs
 import json
 import os
 import stat
@@ -43,6 +44,32 @@ def _parser() -> argparse.ArgumentParser:
     inspect_parser.add_argument("ddl_path")
     inspect_parser.add_argument("--config", required=True, dest="config_path")
     return parser
+
+
+def _uses_utf8(encoding: object) -> bool:
+    if not isinstance(encoding, str):
+        return False
+    try:
+        return codecs.lookup(encoding).name == "utf-8"
+    except LookupError:
+        return False
+
+
+def _require_utf8_runtime() -> None:
+    """Reject process encodings that cannot honor the CLI's Unicode contract."""
+    encodings = (
+        ("filesystem", sys.getfilesystemencoding()),
+        ("standard output", getattr(sys.stdout, "encoding", None)),
+        ("standard error", getattr(sys.stderr, "encoding", None)),
+    )
+    incompatible = [
+        label for label, encoding in encodings if encoding is not None and not _uses_utf8(encoding)
+    ]
+    if incompatible:
+        labels = ", ".join(incompatible)
+        raise TableFactoryError(
+            f"UTF-8 runtime is required; {labels} must use UTF-8; set PYTHONUTF8=1"
+        )
 
 
 def _load_configuration(config_value: str, *, cwd: Path) -> object:
@@ -137,8 +164,9 @@ def _silence_broken_stdout() -> None:
 def main(argv: Sequence[str] | None = None) -> int:
     """Run the CLI and return a process exit code."""
     parser = _parser()
-    arguments = parser.parse_args(argv)
     try:
+        _require_utf8_runtime()
+        arguments = parser.parse_args(argv)
         exit_code = _run(arguments, cwd=_current_working_directory())
         sys.stdout.flush()
         return exit_code

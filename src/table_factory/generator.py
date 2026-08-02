@@ -165,6 +165,13 @@ def ensure_unique_artifacts(artifacts: list[Artifact]) -> None:
 def _destination_name(filename: str) -> str:
     if not filename or filename in {".", ".."} or Path(filename).name != filename:
         raise OutputSafetyError("generated filename is not a plain filename")
+    try:
+        os.fsencode(filename)
+    except UnicodeEncodeError:
+        raise OutputSafetyError(
+            "generated filename cannot be represented by the process filesystem encoding; "
+            "UTF-8 is required"
+        ) from None
     return filename
 
 

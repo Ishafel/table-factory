@@ -260,7 +260,7 @@ def test_hive_comments_and_column_constraints_are_accepted() -> None:
         "payload STRUCT<name:STRING COMMENT 'display name', amount:DECIMAL(10,2)>,"
         'id BIGINT NOT NULL ENABLE COMMENT "required",'
         "status STRING DEFAULT 'active',"
-        "price DOUBLE CHECK (price > 0) RELY"
+        "price DOUBLE UNIQUE DISABLE NOVALIDATE RELY"
         ");"
     )[0]
 
@@ -273,6 +273,123 @@ def test_hive_comments_and_column_constraints_are_accepted() -> None:
     ]
     assert table.external is True
     assert table.columns[1].comment == "required"
+
+
+@pytest.mark.parametrize(
+    "column_definition",
+    (
+        "id INT DEFAULT 1 DEFAULT 2",
+        "id INT COMMENT 'identifier' NOT NULL",
+        "id INT NOT NULL ENABLE DISABLE",
+        "id INT NOT NULL NOT NULL",
+        "id INT DEFAULT 1 RELY",
+        "id INT DEFAULT 1 NOVALIDATE",
+        "id INT DEFAULT 1 DISABLE ENABLE",
+    ),
+)
+def test_column_constraint_order_and_cardinality_are_strict(
+    column_definition: str,
+) -> None:
+    with pytest.raises(DdlParseError):
+        parse_hive_ddl(f"CREATE TABLE constrained ({column_definition});")
+
+
+@pytest.mark.parametrize(
+    "default_value",
+    (
+        "arbitrary_identifier",
+        "now()",
+        "(1 + 2)",
+        "1 + 2",
+        "array(1)",
+    ),
+)
+def test_default_values_outside_the_documented_whitelist_are_rejected(
+    default_value: str,
+) -> None:
+    with pytest.raises(DdlParseError):
+        parse_hive_ddl(f"CREATE TABLE constrained (value INT DEFAULT {default_value});")
+
+
+def test_documented_default_values_and_modifiers_are_accepted() -> None:
+    ddl = (
+        "CREATE TABLE defaults ("
+        "negative_value INT DEFAULT -1,"
+        "label STRING CONSTRAINT label_default DEFAULT 'unknown' ENABLE,"
+        "created DATE DEFAULT CURRENT_DATE(),"
+        "updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP DISABLE,"
+        "owner STRING DEFAULT CURRENT_USER(),"
+        "nullable INT DEFAULT NULL,"
+        "flag BOOLEAN DEFAULT TRUE,"
+        "code VARCHAR(10) DEFAULT CAST('x' AS VARCHAR(10)) ENFORCED,"
+        "nested_code STRING DEFAULT CAST(CAST('x' AS VARCHAR(10)) AS STRING)"
+        ");"
+    )
+
+    table = parse_hive_ddl(ddl)[0]
+
+    assert [column.name for column in table.columns] == [
+        "negative_value",
+        "label",
+        "created",
+        "updated",
+        "owner",
+        "nullable",
+        "flag",
+        "code",
+        "nested_code",
+    ]
+
+
+def test_official_column_constraint_forms_and_comment_position_are_accepted() -> None:
+    ddl = (
+        "CREATE TABLE constrained ("
+        "id BIGINT CONSTRAINT id_pk PRIMARY KEY DISABLE NOVALIDATE RELY "
+        "COMMENT 'identifier',"
+        "code STRING UNIQUE NOT ENFORCED NORELY,"
+        "parent_id BIGINT REFERENCES parent(id) DISABLE NOVALIDATE,"
+        "required STRING NOT NULL ENABLE NOVALIDATE RELY"
+        ");"
+    )
+
+    table = parse_hive_ddl(ddl)[0]
+
+    assert table.columns[0].comment == "identifier"
+
+
+@pytest.mark.parametrize(
+    "constraint",
+    (
+        "CHECK ()",
+        "CHECK (id +)",
+        "CHECK (id > 0)",
+    ),
+)
+def test_column_check_constraints_fail_closed(constraint: str) -> None:
+    with pytest.raises(DdlParseError, match="CHECK constraints are unsupported"):
+        parse_hive_ddl(f"CREATE TABLE constrained (id INT {constraint});")
+
+
+@pytest.mark.parametrize(
+    "constraint",
+    (
+        "CHECK ()",
+        "CHECK (id +)",
+        "CONSTRAINT positive_id CHECK (id > 0)",
+    ),
+)
+def test_table_check_constraints_fail_closed(constraint: str) -> None:
+    with pytest.raises(DdlParseError, match="CHECK constraints are unsupported"):
+        parse_hive_ddl(f"CREATE TABLE constrained (id INT, {constraint});")
+
+
+def test_table_constraint_modifiers_follow_official_order_and_cardinality() -> None:
+    valid = "CREATE TABLE constrained (id INT, PRIMARY KEY (id) DISABLE NOVALIDATE RELY);"
+
+    assert parse_hive_ddl(valid)[0].name == "constrained"
+
+    with pytest.raises(DdlParseError, match="constraint modifiers"):
+        parse_hive_ddl("CREATE TABLE constrained (id INT, PRIMARY KEY (id) ENABLE DISABLE);")
 
 
 def test_table_clauses_are_validated_and_preserved_verbatim() -> None:
@@ -322,6 +439,91 @@ def test_parenthesized_hive_clauses_support_backtick_identifiers() -> None:
 def test_malformed_hive_identifier_and_sort_lists_are_rejected(tail: str) -> None:
     with pytest.raises(DdlParseError):
         parse_hive_ddl(f"CREATE TABLE events (id BIGINT) {tail};")
+
+
+@pytest.mark.parametrize(
+    "tail",
+    (
+        "SKEWED BY (id) ON ()",
+        "SKEWED BY (id) ON (id +)",
+        "SKEWED BY (id) ON (-1)",
+        "SKEWED BY (id) ON (1,,2)",
+        "SKEWED BY (id) ON (SELECT * FROM source)",
+        "SKEWED BY (id, category) ON (1, 2)",
+        "SKEWED BY (id, category) ON ((1), (2))",
+        "SKEWED BY (id, category) ON ((1, 'a'), (2))",
+        "SKEWED BY (id) ON (1, (2))",
+    ),
+)
+def test_skewed_by_on_rejects_malformed_values_and_wrong_tuple_arity(tail: str) -> None:
+    with pytest.raises(DdlParseError, match="SKEWED BY ON"):
+        parse_hive_ddl(f"CREATE TABLE events (id BIGINT, category STRING) {tail};")
+
+
+@pytest.mark.parametrize(
+    "tail",
+    (
+        "SKEWED BY (id) ON (1, 2, NULL, 'unknown')",
+        "SKEWED BY (id) ON ((1), (2))",
+        ("SKEWED BY (id, category) ON ((1, 'one'), (2, 'two')) STORED AS DIRECTORIES"),
+    ),
+)
+def test_skewed_by_on_accepts_constants_and_matching_tuples(tail: str) -> None:
+    ddl = f"CREATE TABLE events (id BIGINT, category STRING) {tail};"
+
+    assert parse_hive_ddl(ddl)[0].create_sql == ddl
+
+
+@pytest.mark.parametrize(
+    ("columns", "tail"),
+    (
+        ("id BIGINT", "CLUSTERED BY (missing) INTO 4 BUCKETS"),
+        (
+            "id BIGINT",
+            "CLUSTERED BY (id) SORTED BY (missing DESC) INTO 4 BUCKETS",
+        ),
+        ("id BIGINT", "SKEWED BY (missing) ON (1)"),
+        (
+            "id BIGINT, PRIMARY KEY (missing) DISABLE NOVALIDATE",
+            "",
+        ),
+        (
+            "id BIGINT, UNIQUE (missing) DISABLE NOVALIDATE",
+            "",
+        ),
+        (
+            "id BIGINT, FOREIGN KEY (missing) REFERENCES parent(id) DISABLE NOVALIDATE",
+            "",
+        ),
+    ),
+)
+def test_structural_references_must_name_ordinary_columns(
+    columns: str,
+    tail: str,
+) -> None:
+    with pytest.raises(DdlParseError, match="unknown ordinary column 'missing'"):
+        parse_hive_ddl(f"CREATE TABLE events ({columns}) {tail};")
+
+
+def test_structural_references_are_resolved_case_insensitively() -> None:
+    ddl = (
+        "CREATE TABLE events ("
+        "`MiXeD` BIGINT, Category STRING,"
+        "PRIMARY KEY (mixed) DISABLE NOVALIDATE,"
+        "UNIQUE (CATEGORY) DISABLE NOVALIDATE,"
+        "FOREIGN KEY (MIXED) REFERENCES parent(id) DISABLE NOVALIDATE"
+        ") "
+        "CLUSTERED BY (MIXED) SORTED BY (category DESC) INTO 4 BUCKETS "
+        "SKEWED BY (mixed, CATEGORY) ON ((1, 'one'));"
+    )
+
+    assert parse_hive_ddl(ddl)[0].name == "events"
+
+
+def test_structural_reference_matching_uses_nfkc_casefolding() -> None:
+    ddl = "CREATE TABLE events (`Ｋey` BIGINT) CLUSTERED BY (`key`) INTO 2 BUCKETS;"
+
+    assert parse_hive_ddl(ddl)[0].name == "events"
 
 
 @pytest.mark.parametrize("bucket_count", ("0", "000"))

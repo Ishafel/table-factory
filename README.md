@@ -151,7 +151,8 @@ TBLPROPERTIES (
 - `TEMPORARY`, `EXTERNAL` и `IF NOT EXISTS`;
 - column и table `COMMENT`;
 - `PARTITIONED BY`;
-- распространённые column/table constraints;
+- column constraints `NOT NULL`, `DEFAULT`, `PRIMARY KEY`, `UNIQUE` и
+  `REFERENCES`, а также table-level `PRIMARY KEY`, `UNIQUE` и `FOREIGN KEY`;
 - `CLUSTERED BY` с необязательным `SORTED BY`, `SKEWED BY` с необязательным
   `STORED AS DIRECTORIES` и другие перечисленные ниже table clauses в
   стандартном Hive-порядке;
@@ -162,6 +163,21 @@ TBLPROPERTIES (
 - разорванные на несколько значений Spark schema properties: они остаются
   properties и не становятся колонками;
 - `-- ...` и `/* ... */` SQL-комментарии при разборе.
+
+После типа колонки допускается не более одного constraint (с необязательным
+`CONSTRAINT name`), затем — не более одного `COMMENT`. Для `DEFAULT`
+принимаются только literals, `CURRENT_TIME`, `CURRENT_DATE`,
+`CURRENT_TIMESTAMP`, `CURRENT_USER()`, `NULL` и ограниченно вложенные `CAST`
+этих значений в primitive Hive type; допустимые modifiers — `ENABLE`,
+`ENFORCED` или `DISABLE`. `CHECK` намеренно отклоняется fail-closed, поскольку
+проект не реализует безопасный parser Hive expressions.
+
+`SKEWED BY ... ON (...)` требует непустой список constants: для одной skewed
+column это scalar values, для нескольких — tuples совпадающей арности.
+Ссылки из `CLUSTERED BY`, `SORTED BY`, `SKEWED BY` и локальные columns из
+table-level `PRIMARY KEY`, `UNIQUE`, `FOREIGN KEY` должны указывать на ordinary
+columns той же таблицы; сравнение выполняется через Unicode NFKC без учёта
+регистра. Partition columns такими structural references быть не могут.
 
 Source storage и структурные clauses нужны только для корректного разбора. Они
 не определяют новую Hive-таблицу: source `TEMPORARY`, `IF NOT EXISTS`,
@@ -191,6 +207,8 @@ database. Для однозначной цепочки предпочтител�
 - `CREATE TABLE LIKE`;
 - SQL-команды и запросы, отличные от поддержанного `CREATE TABLE`;
 - malformed DDL, повторные или расположенные в неверном порядке table clauses;
+- повторные, переставленные или неподдерживаемые column constraints, включая
+  любые `CHECK` expressions и произвольные `DEFAULT` expressions;
 - пустой список колонок;
 - double-quoted identifiers и unquoted identifiers вне ASCII-грамматики
   `[A-Za-z_][A-Za-z0-9_]*`; произвольные имена нужно заключать в backticks;
@@ -207,6 +225,14 @@ database. Для однозначной цепочки предпочтител�
 Input может быть одним `.sql`-файлом или директорией. Директория обходится
 рекурсивно и детерминированно, расширение `.sql` сравнивается без учёта
 регистра. Все документы читаются как UTF-8 и проверяются до начала записи.
+
+Обход ограничен 64 уровнями вложенных каталогов, 1024 SQL-файлами, `8 MiB` на
+один SQL-файл и `64 MiB` суммарного размера SQL. Само дерево ограничено 4096
+каталогами, включая input root, и 16384 filesystem entries. Сначала итеративно
+собираются и проверяются только метаданные; затем файлы читаются и разбираются
+по одному, поэтому scanner не удерживает одновременно descriptor-ы всех
+предков или содержимое всего input batch. Превышение любого лимита возвращает
+контролируемый code `2` до записи output.
 
 ## Выходные файлы
 
@@ -772,11 +798,12 @@ traceback и не раскрывают абсолютные host paths.
   symlink-компоненты input path отклоняются; то же правило действует для
   output directory и её родительских компонентов. Стабильные root-owned
   системные aliases вроде macOS `/var` и `/tmp` разрешены.
-- Input tree закрепляется directory descriptor-ами; каждый SQL-файл открывается
-  относительно проверенного parent descriptor с `O_NOFOLLOW`, сверяется через
-  `fstat` и читается из того же file descriptor. Поэтому замена уже принятого
-  pathname не перенаправляет чтение, а filesystem identity фактически
-  прочитанного файла сохраняется для последующих проверок.
+- Input root закрепляется directory descriptor-ом; вложенные компоненты
+  итеративно переоткрываются относительно него с `O_NOFOLLOW`, а ожидаемая
+  filesystem identity сверяется до чтения. SQL читается из того же проверенного
+  file descriptor. Поэтому замена уже принятого pathname не перенаправляет
+  чтение, а identity фактически прочитанного файла сохраняется для последующих
+  проверок.
 - Сгенерированное имя является только filename и не может выйти из output
   через path traversal.
 - Ни один destination не может быть тем же файлом, что и прочитанный input
@@ -896,6 +923,11 @@ descriptor-relative файловыми операциями (в частност
 раздела «Быстрый старт»: нативная установка wheel там не поддерживается.
 Метка wheel `py3-none-any` означает отсутствие бинарных расширений, но не
 расширяет этот явно объявленный runtime-контракт на Windows.
+
+Filesystem encoding, `stdout` и `stderr` нативного Python-процесса должны
+использовать UTF-8. При несовместимой locale CLI до чтения входов возвращает
+контролируемый code `2`; для такого окружения задайте `PYTHONUTF8=1`. В Docker
+этот режим уже зафиксирован в image.
 
 Установка wheel на поддерживаемой POSIX-системе:
 

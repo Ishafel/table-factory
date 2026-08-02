@@ -6,6 +6,7 @@ import os
 import re
 import stat
 import string
+import unicodedata
 from collections.abc import Hashable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -37,6 +38,7 @@ _LEGACY_CONFIG_VERSIONS = frozenset({1, 2})
 _MAX_CONFIG_BYTES = 1024 * 1024
 _MAX_YAML_DEPTH = 64
 _MAX_YAML_INTEGER_CHARACTERS = 128
+_UNSAFE_TEXT_CATEGORIES = frozenset({"Cc", "Cf", "Zl", "Zp"})
 _YAML_INTEGER_TAG = "tag:yaml.org,2002:int"
 _YAML_TIMESTAMP_TAG = "tag:yaml.org,2002:timestamp"
 ARTIFACT_ROLES = (
@@ -282,7 +284,7 @@ def _mapping(value: object, label: str) -> dict[str, Any]:
 
 
 def _safe_diagnostic_text(value: str) -> str:
-    """Escape terminal control characters before including user text in errors."""
+    """Escape non-printable characters before including user text in errors."""
     return "".join(
         character
         if character.isprintable() and character not in "\r\n"
@@ -308,13 +310,25 @@ def _keys(
         raise ConfigurationError(f"{label} is missing required key: {missing[0]}")
 
 
-def _string_value(value: object, label: str) -> str:
+def _string_value(
+    value: object,
+    label: str,
+    *,
+    reject_unsafe_unicode_categories: bool = True,
+) -> str:
     if not isinstance(value, str):
         raise ConfigurationError(f"{label} must be a string")
     if not value:
         raise ConfigurationError(f"{label} must not be empty")
     if any(ord(character) < 32 or ord(character) == 127 for character in value):
         raise ConfigurationError(f"{label} must not contain control characters")
+    if reject_unsafe_unicode_categories and any(
+        unicodedata.category(character) in _UNSAFE_TEXT_CATEGORIES for character in value
+    ):
+        raise ConfigurationError(
+            f"{label} must not contain control characters or Unicode format, line, "
+            "or paragraph separator characters"
+        )
     return value
 
 
@@ -362,7 +376,8 @@ def _template_fields(
         if field_name is None:
             continue
         if field_name not in allowed:
-            raise ConfigurationError(f"{label} contains unknown placeholder: {field_name}")
+            safe_field_name = _safe_diagnostic_text(field_name)
+            raise ConfigurationError(f"{label} contains unknown placeholder: {safe_field_name}")
         if format_spec or conversion:
             raise ConfigurationError(f"{label} placeholders cannot use conversion or formatting")
         fields.append(field_name)
@@ -395,7 +410,11 @@ def _changeset_id_template(value: object) -> str:
 
 
 def _one_character(value: object, label: str) -> str:
-    result = _string_value(value, label)
+    result = _string_value(
+        value,
+        label,
+        reject_unsafe_unicode_categories=False,
+    )
     if len(result) != 1:
         raise ConfigurationError(f"{label} must contain exactly one character")
     return result
@@ -471,7 +490,11 @@ def _load_storage(raw_value: object) -> HiveStorageConfig:
     )
     if field_delimiter == escape_character:
         raise ConfigurationError("hive.storage.field_delimiter and escape_character must differ")
-    null_value = _string_value(raw["null_value"], "hive.storage.null_value")
+    null_value = _string_value(
+        raw["null_value"],
+        "hive.storage.null_value",
+        reject_unsafe_unicode_categories=False,
+    )
     if len(null_value) > 32:
         raise ConfigurationError("hive.storage.null_value must contain at most 32 characters")
     if not null_value.isascii() or not null_value.isprintable():
