@@ -12,13 +12,18 @@ from pathlib import Path
 from typing import Literal
 
 from table_factory.config import FactoryConfig
-from table_factory.errors import DdlParseError, TableFactoryError
+from table_factory.errors import (
+    DdlColumnLimitError,
+    DdlParseError,
+    DdlTableLimitError,
+    TableFactoryError,
+)
 from table_factory.generator import (
     Artifact,
     artifact_filenames,
     ensure_unique_artifact_names,
     ensure_unique_artifacts,
-    render_artifacts,
+    iter_artifacts,
     write_artifacts,
 )
 from table_factory.models import Table, TablePlan
@@ -40,6 +45,9 @@ _MAX_INPUT_SQL_FILE_BYTES = 8 * 1024 * 1024
 _MAX_INPUT_SQL_BYTES = 64 * 1024 * 1024
 _MAX_INPUT_DIRECTORIES = 4096
 _MAX_INPUT_ENTRIES = 16_384
+_MAX_TABLES = 4096
+_MAX_COLUMNS = 65_536
+_MAX_ARTIFACTS = 16_384
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,7 +62,7 @@ class ParsedFile:
 
 @dataclass(frozen=True, slots=True)
 class PreparedWorkflow:
-    """A fully validated workflow whose artifacts are safe to write."""
+    """A fully validated workflow with optionally retained artifacts."""
 
     parsed_files: tuple[ParsedFile, ...]
     plans: tuple[TablePlan, ...]
@@ -544,22 +552,48 @@ def discover_sql_files(input_path: Path, *, cwd: Path) -> tuple[Path, ...]:
         scanned_files.close()
 
 
-def parse_files(input_path: Path, *, cwd: Path) -> tuple[ParsedFile, ...]:
-    """Read and parse every input before any output is created."""
+def _parse_files(input_path: Path, *, cwd: Path) -> tuple[ParsedFile, ...]:
     parsed: list[ParsedFile] = []
+    table_count = 0
+    column_count = 0
+    input_label = display_path(input_path, cwd=cwd)
     scanned_files = _scan_sql_files(input_path, cwd=cwd, read_contents=True)
     try:
         for scanned in scanned_files:
             if scanned.sql is None:
                 raise AssertionError("input scanner omitted requested SQL contents")
             try:
-                tables = parse_hive_ddl(scanned.sql)
+                tables = parse_hive_ddl(
+                    scanned.sql,
+                    max_tables=_MAX_TABLES - table_count,
+                    max_columns=_MAX_COLUMNS - column_count,
+                )
+            except DdlTableLimitError:
+                raise TableFactoryError(
+                    f"input contains more than {_MAX_TABLES} tables: {input_label}"
+                ) from None
+            except DdlColumnLimitError:
+                raise TableFactoryError(
+                    f"input contains more than {_MAX_COLUMNS} columns: {input_label}"
+                ) from None
             except DdlParseError as error:
                 raise DdlParseError(f"{scanned.label}: {error}") from None
             except MemoryError:
                 raise TableFactoryError(
                     f"cannot parse input {scanned.label}: insufficient memory"
                 ) from None
+            table_count += len(tables)
+            if table_count > _MAX_TABLES:
+                raise TableFactoryError(
+                    f"input contains more than {_MAX_TABLES} tables: {input_label}"
+                )
+            column_count += sum(
+                len(table.columns) + len(table.partition_columns) for table in tables
+            )
+            if column_count > _MAX_COLUMNS:
+                raise TableFactoryError(
+                    f"input contains more than {_MAX_COLUMNS} columns: {input_label}"
+                )
             parsed.append(
                 ParsedFile(
                     path=scanned.path,
@@ -571,6 +605,14 @@ def parse_files(input_path: Path, *, cwd: Path) -> tuple[ParsedFile, ...]:
     finally:
         scanned_files.close()
     return tuple(parsed)
+
+
+def parse_files(input_path: Path, *, cwd: Path) -> tuple[ParsedFile, ...]:
+    """Read and parse every bounded input before any output is created."""
+    try:
+        return _parse_files(input_path, cwd=cwd)
+    except MemoryError:
+        raise TableFactoryError("cannot parse input: insufficient memory") from None
 
 
 def _comparison(value: str) -> str:
@@ -630,14 +672,18 @@ def _ensure_unique_targets(plans: tuple[TablePlan, ...]) -> None:
             greenplum_targets[greenplum_key] = greenplum_name
 
 
-def prepare(
+def _prepare(
     input_path: Path,
     *,
     config: FactoryConfig,
     cwd: Path,
+    retain_artifacts: bool,
 ) -> PreparedWorkflow:
-    """Parse, semantically validate, render, and collision-check all inputs."""
     parsed_files = parse_files(input_path, cwd=cwd)
+    table_count = sum(len(parsed_file.tables) for parsed_file in parsed_files)
+    artifact_count = table_count * len(config.output.enabled_artifacts)
+    if artifact_count > _MAX_ARTIFACTS:
+        raise TableFactoryError(f"workflow would generate more than {_MAX_ARTIFACTS} artifacts")
 
     planned: list[TablePlan] = []
     for parsed_file in parsed_files:
@@ -658,19 +704,39 @@ def prepare(
 
     rendered: list[Artifact] = []
     for plan in plans:
-        rendered.extend(
-            render_artifacts(
-                plan,
-                config=config,
-                source_label=plan.source_label,
-            )
-        )
-    ensure_unique_artifacts(rendered)
+        for artifact in iter_artifacts(
+            plan,
+            config=config,
+            source_label=plan.source_label,
+        ):
+            if retain_artifacts:
+                rendered.append(artifact)
+    if retain_artifacts:
+        ensure_unique_artifacts(rendered)
     return PreparedWorkflow(
         parsed_files=parsed_files,
         plans=plans,
         artifacts=tuple(rendered),
     )
+
+
+def prepare(
+    input_path: Path,
+    *,
+    config: FactoryConfig,
+    cwd: Path,
+    retain_artifacts: bool = True,
+) -> PreparedWorkflow:
+    """Parse, validate, render, and optionally retain all generated contents."""
+    try:
+        return _prepare(
+            input_path,
+            config=config,
+            cwd=cwd,
+            retain_artifacts=retain_artifacts,
+        )
+    except MemoryError:
+        raise TableFactoryError("cannot prepare workflow: insufficient memory") from None
 
 
 def generate(
@@ -681,10 +747,13 @@ def generate(
     cwd: Path,
 ) -> int:
     """Parse all inputs, then atomically write their generated artifacts."""
-    prepared = prepare(input_path, config=config, cwd=cwd)
-    write_artifacts(
-        output_path,
-        list(prepared.artifacts),
-        input_identities=tuple(parsed_file.identity for parsed_file in prepared.parsed_files),
-    )
-    return len(prepared.artifacts)
+    try:
+        prepared = prepare(input_path, config=config, cwd=cwd)
+        write_artifacts(
+            output_path,
+            list(prepared.artifacts),
+            input_identities=tuple(parsed_file.identity for parsed_file in prepared.parsed_files),
+        )
+        return len(prepared.artifacts)
+    except MemoryError:
+        raise TableFactoryError("cannot complete workflow: insufficient memory") from None

@@ -11,6 +11,7 @@ import sys
 from collections.abc import Sequence
 from contextlib import suppress
 from pathlib import Path
+from typing import TextIO
 
 from table_factory.config import load_config
 from table_factory.errors import TableFactoryError
@@ -104,7 +105,12 @@ def _run(arguments: argparse.Namespace, *, cwd: Path) -> int:
 
     if arguments.command == "validate":
         input_path = resolve_from_cwd(arguments.input_path, cwd=cwd)
-        prepared = prepare(input_path, config=config, cwd=cwd)
+        prepared = prepare(
+            input_path,
+            config=config,
+            cwd=cwd,
+            retain_artifacts=False,
+        )
         print(f"Validated {len(prepared.plans)} table(s) in {len(prepared.parsed_files)} file(s).")
         return 0
 
@@ -123,7 +129,12 @@ def _run(arguments: argparse.Namespace, *, cwd: Path) -> int:
             raise TableFactoryError(f"cannot inspect input {label}: invalid path") from None
         if not stat.S_ISREG(ddl_status.st_mode):
             raise TableFactoryError("inspect requires one SQL file")
-        prepared = prepare(ddl_path, config=config, cwd=cwd)
+        prepared = prepare(
+            ddl_path,
+            config=config,
+            cwd=cwd,
+            retain_artifacts=False,
+        )
         payload = {
             "source": prepared.parsed_files[0].label,
             "config": config.as_dict(),
@@ -142,29 +153,41 @@ def _current_working_directory() -> Path:
         raise TableFactoryError("current working directory is unavailable") from None
 
 
-def _silence_broken_stdout() -> None:
+def _silence_broken_stream(stream: TextIO) -> None:
     """Prevent interpreter shutdown from flushing a closed pipe again."""
     try:
-        stdout_descriptor = sys.stdout.fileno()
-    except (AttributeError, OSError, ValueError):
+        stream_descriptor = stream.fileno()
+    except Exception:
         return
     try:
         null_descriptor = os.open(os.devnull, os.O_WRONLY)
-    except OSError:
+    except Exception:
         return
     try:
-        os.dup2(null_descriptor, stdout_descriptor)
-    except OSError:
+        os.dup2(null_descriptor, stream_descriptor)
+    except Exception:
         pass
     finally:
-        with suppress(OSError):
+        with suppress(Exception):
             os.close(null_descriptor)
+
+
+def _silence_broken_stdout() -> None:
+    _silence_broken_stream(sys.stdout)
+
+
+def _write_cli_error(error: object) -> None:
+    """Best-effort error reporting that cannot replace the documented exit code."""
+    try:
+        print("table-factory: error:", error, file=sys.stderr, flush=True)
+    except (MemoryError, OSError, ValueError):
+        _silence_broken_stream(sys.stderr)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     """Run the CLI and return a process exit code."""
-    parser = _parser()
     try:
+        parser = _parser()
         _require_utf8_runtime()
         arguments = parser.parse_args(argv)
         exit_code = _run(arguments, cwd=_current_working_directory())
@@ -173,8 +196,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     except BrokenPipeError:
         _silence_broken_stdout()
         return 0
+    except MemoryError:
+        _write_cli_error("insufficient memory")
+        return 2
     except TableFactoryError as error:
-        print(f"table-factory: error: {error}", file=sys.stderr)
+        _write_cli_error(error)
         return 2
 
 

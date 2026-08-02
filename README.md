@@ -153,7 +153,8 @@ TBLPROPERTIES (
 - `PARTITIONED BY`;
 - column constraints `NOT NULL`, `DEFAULT`, `PRIMARY KEY`, `UNIQUE` и
   `REFERENCES`, а также table-level `PRIMARY KEY`, `UNIQUE` и `FOREIGN KEY`;
-- `CLUSTERED BY` с необязательным `SORTED BY`, `SKEWED BY` с необязательным
+- `CLUSTERED BY` с необязательным `SORTED BY` (`ASC`/`DESC` и
+  `NULLS FIRST`/`NULLS LAST`), `SKEWED BY` с необязательным
   `STORED AS DIRECTORIES` и другие перечисленные ниже table clauses в
   стандартном Hive-порядке;
 - source `ROW FORMAT`, `STORED AS`, `STORED AS INPUTFORMAT ... OUTPUTFORMAT`,
@@ -165,19 +166,25 @@ TBLPROPERTIES (
 - `-- ...` и `/* ... */` SQL-комментарии при разборе.
 
 После типа колонки допускается не более одного constraint (с необязательным
-`CONSTRAINT name`), затем — не более одного `COMMENT`. Для `DEFAULT`
-принимаются только literals, `CURRENT_TIME`, `CURRENT_DATE`,
-`CURRENT_TIMESTAMP`, `CURRENT_USER()`, `NULL` и ограниченно вложенные `CAST`
-этих значений в primitive Hive type; допустимые modifiers — `ENABLE`,
-`ENFORCED` или `DISABLE`. `CHECK` намеренно отклоняется fail-closed, поскольку
-проект не реализует безопасный parser Hive expressions.
+`CONSTRAINT name`), затем — не более одного `COMMENT`. Имена constraints должны
+быть уникальны без учёта регистра, а `PRIMARY KEY` может быть только один на
+таблицу. Для `PRIMARY KEY`, `UNIQUE` и `FOREIGN KEY` разрешены только
+`DISABLE`/`NOT ENFORCED`; `VALIDATE` отклоняется. Для `DEFAULT` принимаются
+только type-compatible literals, `CURRENT_DATE`, `CURRENT_TIMESTAMP`,
+`CURRENT_USER()` и ограниченно вложенные `CAST` этих значений в primitive Hive
+type. Bare `NULL` не имеет точного типа и требует явного `CAST(NULL AS type)`;
+непроверяемая совместимость отклоняется fail-closed. `DEFAULT` запрещён у
+`EXTERNAL` tables, а его допустимые modifiers —
+`ENABLE`, `ENFORCED` или `DISABLE`. `CHECK` намеренно отклоняется fail-closed,
+поскольку проект не реализует безопасный parser Hive expressions.
 
 `SKEWED BY ... ON (...)` требует непустой список constants: для одной skewed
 column это scalar values, для нескольких — tuples совпадающей арности.
 Ссылки из `CLUSTERED BY`, `SORTED BY`, `SKEWED BY` и локальные columns из
 table-level `PRIMARY KEY`, `UNIQUE`, `FOREIGN KEY` должны указывать на ordinary
-columns той же таблицы; сравнение выполняется через Unicode NFKC без учёта
-регистра. Partition columns такими structural references быть не могут.
+columns той же таблицы; сравнение выполняется без учёта регистра, но без
+Unicode compatibility normalization (например, fullwidth и ASCII identifiers
+остаются разными). Partition columns такими structural references быть не могут.
 
 Source storage и структурные clauses нужны только для корректного разбора. Они
 не определяют новую Hive-таблицу: source `TEMPORARY`, `IF NOT EXISTS`,
@@ -233,6 +240,12 @@ Input может быть одним `.sql`-файлом или директор
 по одному, поэтому scanner не удерживает одновременно descriptor-ы всех
 предков или содержимое всего input batch. Превышение любого лимита возвращает
 контролируемый code `2` до записи output.
+
+Во время разбора input batch дополнительно ограничен 4096 таблицами и 65536
+обычными плюс partition columns; parser прекращает работу сразу после
+исчерпания соответствующего budget. Число включённых output artifacts
+ограничено 16384. `validate` рендерит их последовательно для полной проверки,
+не удерживая содержимое всех артефактов в памяти одновременно.
 
 ## Выходные файлы
 

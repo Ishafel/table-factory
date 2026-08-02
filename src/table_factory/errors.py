@@ -13,6 +13,14 @@ class DdlParseError(TableFactoryError):
     """A Hive DDL document cannot be represented by the parser."""
 
 
+class DdlTableLimitError(DdlParseError):
+    """A DDL document exceeds the caller's remaining table budget."""
+
+
+class DdlColumnLimitError(DdlParseError):
+    """A DDL document exceeds the caller's remaining column budget."""
+
+
 class SemanticValidationError(TableFactoryError):
     """A parsed table cannot be transformed safely with the active config."""
 

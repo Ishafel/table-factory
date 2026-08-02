@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
 from pathlib import Path
 
 import pytest
 from conftest import invoke_cli, parse_json_output
 
+import table_factory.cli as cli_module
 import table_factory.generator as generator_module
 import table_factory.path_safety as path_safety_module
 import table_factory.workflow as workflow_module
@@ -109,6 +111,90 @@ def test_cli_handles_a_closed_stdout_pipe_without_a_traceback(
         assert main(arguments) == 0
     finally:
         closed_pipe.close()
+
+
+def test_cli_preserves_error_exit_code_when_stderr_pipe_is_closed(
+    cli_case: dict[str, Path],
+) -> None:
+    read_descriptor, write_descriptor = os.pipe()
+    os.close(read_descriptor)
+    try:
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "table_factory.cli",
+                "validate",
+                "--input",
+                str(cli_case["ddl"]),
+                "--config",
+                str(cli_case["root"] / "missing.yaml"),
+            ],
+            cwd=cli_case["root"],
+            stdout=subprocess.PIPE,
+            stderr=write_descriptor,
+            text=True,
+            check=False,
+        )
+    finally:
+        os.close(write_descriptor)
+
+    assert result.returncode == 2
+    assert result.stdout == ""
+
+
+def test_cli_preserves_error_exit_code_when_silencing_stderr_exhausts_memory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class BrokenErrorStream:
+        encoding = "utf-8"
+
+        def write(self, _value: str) -> int:
+            raise BrokenPipeError
+
+        def flush(self) -> None:
+            raise BrokenPipeError
+
+        def fileno(self) -> int:
+            raise MemoryError
+
+    def exhaust_memory() -> object:
+        raise MemoryError
+
+    monkeypatch.setattr(sys, "stderr", BrokenErrorStream())
+    monkeypatch.setattr(cli_module, "_parser", exhaust_memory)
+
+    assert main(()) == 2
+
+
+@pytest.mark.parametrize("boundary", ("argument-parser", "configuration"))
+def test_cli_normalizes_memory_error_across_the_entire_boundary(
+    cli_case: dict[str, Path],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    boundary: str,
+) -> None:
+    def exhaust_memory(*_args: object, **_kwargs: object) -> object:
+        raise MemoryError
+
+    target = "_parser" if boundary == "argument-parser" else "_load_configuration"
+    monkeypatch.setattr(cli_module, target, exhaust_memory)
+
+    exit_code = main(
+        (
+            "validate",
+            "--input",
+            str(cli_case["ddl"]),
+            "--config",
+            str(cli_case["config"]),
+        )
+    )
+
+    captured = capsys.readouterr()
+    assert exit_code == 2
+    assert captured.out == ""
+    assert captured.err == "table-factory: error: insufficient memory\n"
+    assert "Traceback" not in captured.err
 
 
 def test_cli_normalizes_an_unavailable_current_working_directory(
@@ -1460,6 +1546,81 @@ def test_write_artifacts_restores_the_whole_set_when_second_commit_fails(
         "first.sql",
         "second.sql",
     ]
+
+
+@pytest.mark.parametrize("failure_phase", ("backup", "commit"))
+def test_write_artifacts_rolls_back_memory_error_after_successful_rename(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_phase: str,
+) -> None:
+    output = tmp_path / "output"
+    output.mkdir()
+    first = output / "first.sql"
+    second = output / "second.sql"
+    first.write_text("old first\n", encoding="utf-8")
+    second.write_text("old second\n", encoding="utf-8")
+    artifacts = [
+        Artifact(filename=first.name, content="new first\n"),
+        Artifact(filename=second.name, content="new second\n"),
+    ]
+    real_replace = generator_module._replace_in_directory
+    injected = False
+    selected_renames = 0
+
+    def replace_then_exhaust_memory(
+        directory_fd: int,
+        source: str,
+        destination: str,
+    ) -> None:
+        nonlocal injected, selected_renames
+        real_replace(directory_fd, source, destination)
+        is_selected_phase = (failure_phase == "backup" and destination.endswith(".bak")) or (
+            failure_phase == "commit" and source.endswith(".tmp")
+        )
+        if is_selected_phase:
+            selected_renames += 1
+        if selected_renames == 2 and not injected:
+            injected = True
+            raise MemoryError
+
+    monkeypatch.setattr(
+        generator_module,
+        "_replace_in_directory",
+        replace_then_exhaust_memory,
+    )
+
+    with pytest.raises(MemoryError):
+        write_artifacts(output, artifacts)
+
+    assert injected
+    assert first.read_text(encoding="utf-8") == "old first\n"
+    assert second.read_text(encoding="utf-8") == "old second\n"
+    assert sorted(path.name for path in output.iterdir()) == [
+        "first.sql",
+        "second.sql",
+    ]
+
+
+def test_write_artifacts_removes_staged_file_after_memory_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    output = tmp_path / "output"
+    output.mkdir()
+
+    def exhaust_memory(_descriptor: int) -> None:
+        raise MemoryError
+
+    monkeypatch.setattr(os, "fsync", exhaust_memory)
+
+    with pytest.raises(MemoryError):
+        write_artifacts(
+            output,
+            [Artifact(filename="artifact.sql", content="generated\n")],
+        )
+
+    assert list(output.iterdir()) == []
 
 
 def test_write_artifacts_reports_backup_cleanup_failure_without_raw_io_error(

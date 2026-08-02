@@ -5,8 +5,10 @@ from __future__ import annotations
 import re
 import unicodedata
 from collections.abc import Iterator
+from dataclasses import dataclass
+from datetime import date, datetime
 
-from table_factory.errors import DdlParseError
+from table_factory.errors import DdlColumnLimitError, DdlParseError, DdlTableLimitError
 from table_factory.models import Column, Table
 
 _IDENTIFIER = r"(?:`(?:``|[^`])+`|[A-Za-z_][A-Za-z0-9_]*)"
@@ -60,21 +62,13 @@ _COLUMN_CLAUSE_KEYWORDS = {
 }
 _HIVE_STRING_PATTERN = r"(?:'(?:''|\\.|[^'])*'|\"(?:\"\"|\\.|[^\"])*\")"
 _HIVE_NUMERIC_LITERAL = re.compile(
-    r"[+-]?(?:(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[Ee][+-]?[0-9]+)?)"
-    r"(?:BD|[YSLFD])?",
-    flags=re.IGNORECASE,
+    r"[+-]?[0-9]+(?:\.[0-9]*)?(?:[Ee][+-]?[0-9]+)?"
+    r"(?:BD|[YSLDd])?",
 )
-_GENERIC_CONSTRAINT_OPTIONS = re.compile(
-    r"(?:"
-    r"ENABLE(?:\s+(?:VALIDATE|NOVALIDATE))?"
-    r"|DISABLE(?:\s+(?:VALIDATE|NOVALIDATE))?"
-    r"|ENFORCED"
-    r"|NOT\s+ENFORCED"
-    r")(?:\s+(?:RELY|NORELY))?\b",
-    flags=re.IGNORECASE,
-)
-_DEFAULT_CONSTRAINT_OPTIONS = re.compile(
-    r"(?:ENABLE|ENFORCED|DISABLE)\b",
+_CONSTRAINT_MODIFIERS = re.compile(
+    r"(?:\s*(?P<enforcement>ENABLE|DISABLE|ENFORCED|NOT\s+ENFORCED)\b)?"
+    r"(?:\s+(?P<validation>VALIDATE|NOVALIDATE)\b)?"
+    r"(?:\s+(?P<reliance>RELY|NORELY)\b)?",
     flags=re.IGNORECASE,
 )
 _TABLE_CLAUSE_ORDER = {
@@ -90,12 +84,68 @@ _TABLE_CLAUSE_ORDER = {
 _MAX_TYPE_PARAMETER_DIGITS = 32
 _MAX_TYPE_NESTING = 100
 _MAX_DEFAULT_CAST_NESTING = 32
+_MAX_CONSTRAINT_NAME_LENGTH = 255
+_MAX_DEFAULT_VALUE_LENGTH = 255
 
 type _StructuralReference = tuple[str, tuple[str, ...]]
 
 
-def _identifier_comparison(value: str) -> str:
+@dataclass(frozen=True, slots=True)
+class _DefaultValue:
+    expression: str
+    data_type: str | None
+    is_null: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class _Constraint:
+    kind: str
+    name: str | None
+    local_columns: tuple[str, ...] = ()
+    default_value: _DefaultValue | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _ConstraintModifiers:
+    enforcement: str | None
+    validation: str | None
+    reliance: str | None
+
+
+def _identifier_collision_key(value: str) -> str:
+    """Return the conservative key used to prevent Unicode name collisions."""
     return unicodedata.normalize("NFKC", value).casefold()
+
+
+def _hive_identifier_key(value: str) -> tuple[int, str]:
+    """Approximate Java Character simple-case comparison without normalization."""
+
+    def simple_case_character(character: str) -> str:
+        if character in {"I", "i", "\u0130", "\u0131"}:
+            return "i"
+        uppercase = character.upper()
+        if len(uppercase) == 1:
+            lowered_uppercase = uppercase.lower()
+            if len(lowered_uppercase) == 1:
+                return lowered_uppercase
+        lowercase = character.lower()
+        return lowercase if len(lowercase) == 1 else character
+
+    return len(value), "".join(simple_case_character(character) for character in value)
+
+
+def _java_string_length(value: str) -> int:
+    """Return Java String.length(), measured in UTF-16 code units."""
+    return len(value.encode("utf-16-le", errors="surrogatepass")) // 2
+
+
+def _validated_constraint_name(raw_name: str) -> str:
+    name = _unquote(raw_name)
+    if _java_string_length(name) > _MAX_CONSTRAINT_NAME_LENGTH:
+        raise DdlParseError(
+            f"constraint name exceeds the supported length of {_MAX_CONSTRAINT_NAME_LENGTH}"
+        )
+    return name
 
 
 def _quoted_scan_step(
@@ -249,8 +299,9 @@ def _top_level_parts(value: str, *, delimiter: str = ",") -> Iterator[str]:
 def _split_column_clauses(
     type_and_comment: str,
     *,
+    column_name: str,
     allow_constraints: bool = True,
-) -> tuple[str, str | None]:
+) -> tuple[str, str | None, _Constraint | None]:
     """Separate a Hive type from supported top-level column clauses."""
     round_depth = 0
     angle_depth = 0
@@ -280,15 +331,14 @@ def _split_column_clauses(
             before = type_and_comment[index - 1] if index else " "
             if keyword in _COLUMN_CLAUSE_KEYWORDS and not (before.isalnum() or before == "_"):
                 clauses = type_and_comment[index:].strip()
-                return (
-                    type_and_comment[:index].strip(),
-                    _parse_column_clauses(
-                        clauses,
-                        allow_constraints=allow_constraints,
-                    ),
+                comment, constraint = _parse_column_clauses(
+                    clauses,
+                    column_name=column_name,
+                    allow_constraints=allow_constraints,
                 )
+                return type_and_comment[:index].strip(), comment, constraint
         index += 1
-    return type_and_comment.strip(), None
+    return type_and_comment.strip(), None, None
 
 
 def _quoted_literal_end(value: str, start: int = 0) -> int:
@@ -401,7 +451,7 @@ def _identifier_list(value: str, *, label: str) -> tuple[str, ...]:
     ):
         raise DdlParseError(f"{label} must contain only column identifiers")
     identifiers = tuple(_unquote(part) for part in parts)
-    comparisons = tuple(_identifier_comparison(identifier) for identifier in identifiers)
+    comparisons = tuple(_identifier_collision_key(identifier) for identifier in identifiers)
     if len(set(comparisons)) != len(comparisons):
         raise DdlParseError(f"{label} must not repeat column identifiers")
     return identifiers
@@ -411,7 +461,8 @@ def _sort_list(value: str) -> tuple[str, ...]:
     parts = tuple(_top_level_parts(value))
     matches = tuple(
         re.fullmatch(
-            rf"\s*(?P<name>{_IDENTIFIER})(?:\s+(?:ASC|DESC))?\s*",
+            rf"\s*(?P<name>{_IDENTIFIER})(?:\s+(?:ASC|DESC))?"
+            rf"(?:\s+NULLS\s+(?:FIRST|LAST))?\s*",
             part,
             flags=re.IGNORECASE | re.DOTALL,
         )
@@ -419,10 +470,11 @@ def _sort_list(value: str) -> tuple[str, ...]:
     )
     if not parts or any(match is None for match in matches):
         raise DdlParseError(
-            "SORTED BY must contain only column identifiers with optional ASC or DESC"
+            "SORTED BY must contain only column identifiers with optional ASC/DESC "
+            "and NULLS FIRST/LAST"
         )
     identifiers = tuple(_unquote(match.group("name")) for match in matches if match is not None)
-    comparisons = tuple(_identifier_comparison(identifier) for identifier in identifiers)
+    comparisons = tuple(_identifier_collision_key(identifier) for identifier in identifiers)
     if len(set(comparisons)) != len(comparisons):
         raise DdlParseError("SORTED BY must not repeat column identifiers")
     return identifiers
@@ -515,29 +567,171 @@ def _top_level_as(value: str) -> tuple[str, str]:
     return expression, data_type
 
 
-def _validate_default_cast_type(data_type: str) -> None:
-    """Accept only built-in primitive Hive types as DEFAULT CAST targets."""
-    if re.match(
-        r"(?:ARRAY|MAP|STRUCT|UNIONTYPE)\b",
-        data_type,
-        flags=re.IGNORECASE,
-    ):
-        raise DdlParseError("DEFAULT CAST target must be a primitive Hive type")
-    first_word = re.match(r"[A-Za-z_][A-Za-z0-9_]*", data_type)
-    if first_word is None or first_word.group(0).upper() not in {
-        *_SIMPLE_TYPES,
-        "CHAR",
-        "DECIMAL",
+def _canonical_primitive_type(data_type: str) -> str | None:
+    """Canonicalize a built-in primitive Hive type for exact DEFAULT checks."""
+    normalized = re.sub(r"\s+", " ", data_type.strip().upper())
+    normalized = re.sub(r"\s*([(),])\s*", r"\1", normalized)
+    aliases = {
+        "DOUBLE PRECISION": "DOUBLE",
+        "INTEGER": "INT",
+        "REAL": "FLOAT",
+        "TIMESTAMP WITH LOCAL TIME ZONE": "TIMESTAMPLOCALTZ",
+        "TIMESTAMP_LTZ": "TIMESTAMPLOCALTZ",
+    }
+    normalized = aliases.get(normalized, normalized)
+    if normalized.startswith("NUMERIC"):
+        normalized = f"DECIMAL{normalized[len('NUMERIC') :]}"
+
+    decimal = re.fullmatch(r"DECIMAL(?:\(([0-9]+)(?:,([0-9]+))?\))?", normalized)
+    if decimal:
+        precision = decimal.group(1) or "10"
+        scale = decimal.group(2) or "0"
+        return f"DECIMAL({int(precision)},{int(scale)})"
+    if re.fullmatch(r"(?:CHAR|VARCHAR)\([0-9]+\)", normalized):
+        return normalized
+    if normalized in {
+        "BIGINT",
+        "BINARY",
+        "BOOLEAN",
+        "DATE",
         "DOUBLE",
-        "NUMERIC",
-        "REAL",
-        "VARCHAR",
+        "FLOAT",
+        "INT",
+        "INTERVAL_DAY_TIME",
+        "INTERVAL_YEAR_MONTH",
+        "SMALLINT",
+        "STRING",
+        "TIMESTAMP",
+        "TIMESTAMPLOCALTZ",
+        "TINYINT",
     }:
-        raise DdlParseError("DEFAULT CAST target must be a primitive Hive type")
+        return normalized
+    return None
+
+
+def _validate_default_cast_type(data_type: str) -> str:
+    """Accept only built-in primitive Hive types as DEFAULT CAST targets."""
     _validate_type(data_type)
+    canonical = _canonical_primitive_type(data_type)
+    if canonical is None:
+        raise DdlParseError("DEFAULT CAST target must be a primitive Hive type")
+    return canonical
 
 
-def _default_value_end(value: str, start: int, *, depth: int = 0) -> int:
+def _infer_default_literal_type(expression: str) -> tuple[str | None, bool]:
+    """Infer the exact Hive type of one already-validated literal."""
+    stripped = expression.strip()
+    if stripped[0] in {"'", '"'}:
+        return "STRING", False
+
+    typed = re.match(
+        r"(?P<type>DATE|TIMESTAMP|TIMESTAMPLOCALTZ)\b",
+        stripped,
+        flags=re.IGNORECASE,
+    )
+    if typed:
+        literal, end = _quoted_literal(stripped, typed.end())
+        if stripped[end:].strip():
+            return None, False
+        literal_type = typed.group("type").upper()
+        if not _valid_typed_default_literal(literal_type, literal):
+            return None, False
+        return _canonical_primitive_type(literal_type), False
+
+    upper = stripped.upper()
+    if upper == "NULL":
+        return None, True
+    if upper in {"TRUE", "FALSE"}:
+        return "BOOLEAN", False
+    unsigned = stripped[1:] if stripped.startswith(("+", "-")) else stripped
+
+    integer_suffix_types = {
+        "Y": ("TINYINT", 2**7 - 1),
+        "S": ("SMALLINT", 2**15 - 1),
+        "L": ("BIGINT", 2**63 - 1),
+    }
+    if unsigned.endswith("BD"):
+        return _decimal_literal_type(unsigned[:-2]), False
+    for suffix, (data_type, maximum) in integer_suffix_types.items():
+        if unsigned.endswith(suffix):
+            raw_integer = unsigned[:-1]
+            if re.fullmatch(r"[+-]?[0-9]+", raw_integer) is None:
+                return None, False
+            try:
+                integer = int(raw_integer)
+            except ValueError:
+                return None, False
+            return (data_type if integer <= maximum else None), False
+    if unsigned.endswith(("D", "d")):
+        return "DOUBLE", False
+    if "e" in unsigned.lower():
+        return "DOUBLE", False
+    if "." in unsigned:
+        return _decimal_literal_type(unsigned), False
+    try:
+        number = int(unsigned)
+    except ValueError:
+        return None, False
+    if number <= 2**31 - 1:
+        return "INT", False
+    if number <= 2**63 - 1:
+        return "BIGINT", False
+    return _decimal_literal_type(unsigned), False
+
+
+def _valid_typed_default_literal(literal_type: str, literal: str) -> bool:
+    """Validate the conservative DATE/TIMESTAMP literal subset used by DEFAULT."""
+    try:
+        if literal_type == "DATE":
+            if re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", literal) is None:
+                return False
+            date.fromisoformat(literal)
+            return True
+        if literal_type == "TIMESTAMP":
+            if (
+                re.fullmatch(
+                    r"[0-9]{4}-[0-9]{2}-[0-9]{2}[ T][0-9]{2}:[0-9]{2}:[0-9]{2}"
+                    r"(?:\.[0-9]{1,9})?",
+                    literal,
+                )
+                is None
+            ):
+                return False
+            datetime.fromisoformat(literal)
+            return True
+    except ValueError:
+        return False
+    return False
+
+
+def _decimal_literal_type(value: str) -> str | None:
+    """Infer Hive DECIMAL precision/scale for a non-exponent numeric literal."""
+    unsigned = value.lstrip("+-")
+    if "e" in unsigned.lower():
+        return None
+    whole, separator, fraction = unsigned.partition(".")
+    if not separator:
+        fraction = ""
+    if not whole and not fraction:
+        return None
+    significant_whole = whole.lstrip("0")
+    significant_fraction = fraction.rstrip("0")
+    if not significant_whole and not significant_fraction:
+        return "DECIMAL(1,0)"
+    integer_digits = len(significant_whole)
+    scale = len(significant_fraction)
+    precision = integer_digits + scale if integer_digits else scale
+    if precision > 38 or scale > precision:
+        return None
+    return f"DECIMAL({precision},{scale})"
+
+
+def _default_value_end(
+    value: str,
+    start: int,
+    *,
+    depth: int = 0,
+) -> tuple[_DefaultValue, int]:
     """Parse the documented fail-closed subset of Hive DEFAULT values."""
     if depth > _MAX_DEFAULT_CAST_NESTING:
         raise DdlParseError(
@@ -557,14 +751,16 @@ def _default_value_end(value: str, start: int, *, depth: int = 0) -> int:
             label="DEFAULT CAST",
         )
         expression, data_type = _top_level_as(contents)
-        expression_end = _default_value_end(expression, 0, depth=depth + 1)
+        inner_value, expression_end = _default_value_end(expression, 0, depth=depth + 1)
         if expression[expression_end:].strip():
             raise DdlParseError(
                 "DEFAULT CAST supports only a literal, documented current-value function, "
                 "NULL, or nested CAST"
             )
-        _validate_default_cast_type(data_type)
-        return end
+        if inner_value.data_type is None and not inner_value.is_null:
+            raise DdlParseError("cannot verify the DEFAULT CAST input value")
+        cast_type = _validate_default_cast_type(data_type)
+        return _DefaultValue(value[index:end].strip(), cast_type), end
 
     current_user = re.match(
         r"CURRENT_USER\s*\(\s*\)",
@@ -572,22 +768,25 @@ def _default_value_end(value: str, start: int, *, depth: int = 0) -> int:
         flags=re.IGNORECASE,
     )
     if current_user:
-        return index + current_user.end()
+        end = index + current_user.end()
+        return _DefaultValue(value[index:end].strip(), "STRING"), end
 
-    current_time = re.match(
-        r"(?:CURRENT_TIME|CURRENT_DATE|CURRENT_TIMESTAMP)\b",
+    current_value = re.match(
+        r"(?P<function>CURRENT_DATE|CURRENT_TIMESTAMP)\b",
         value[index:],
         flags=re.IGNORECASE,
     )
-    if current_time:
-        end = index + current_time.end()
+    if current_value:
+        end = index + current_value.end()
         empty_call = re.match(r"\s*\(\s*\)", value[end:])
         if empty_call:
             end += empty_call.end()
-        return end
+        function = current_value.group("function").upper()
+        data_type = "DATE" if function == "CURRENT_DATE" else "TIMESTAMP"
+        return _DefaultValue(value[index:end].strip(), data_type), end
 
     try:
-        return _literal_end(
+        end = _literal_end(
             value,
             index,
             label="DEFAULT",
@@ -595,39 +794,86 @@ def _default_value_end(value: str, start: int, *, depth: int = 0) -> int:
         )
     except DdlParseError:
         raise DdlParseError(
-            "DEFAULT supports only literals, CURRENT_TIME/CURRENT_DATE/"
-            "CURRENT_TIMESTAMP, CURRENT_USER(), NULL, or CAST of those values"
+            "DEFAULT supports only literals, CURRENT_DATE/CURRENT_TIMESTAMP, "
+            "CURRENT_USER(), or CAST of those values"
         ) from None
+    expression = value[index:end].strip()
+    literal_type, is_null = _infer_default_literal_type(expression)
+    return _DefaultValue(expression, literal_type, is_null), end
 
 
-def _constraint_options_end(value: str, start: int, *, default: bool = False) -> int:
-    index = start
-    while index < len(value) and value[index].isspace():
-        index += 1
-    pattern = _DEFAULT_CONSTRAINT_OPTIONS if default else _GENERIC_CONSTRAINT_OPTIONS
-    match = pattern.match(value, index)
-    return match.end() if match else start
+def _constraint_modifiers_end(value: str, start: int, *, kind: str) -> int:
+    match = _CONSTRAINT_MODIFIERS.match(value, start)
+    if match is None:  # pragma: no cover - the all-optional regexp always matches
+        return start
+    modifiers = _ConstraintModifiers(
+        enforcement=(re.sub(r"\s+", " ", (match.group("enforcement") or "").upper()) or None),
+        validation=(match.group("validation") or "").upper() or None,
+        reliance=(match.group("reliance") or "").upper() or None,
+    )
+
+    if modifiers.enforcement is None and (
+        modifiers.validation is not None or modifiers.reliance is not None
+    ):
+        raise DdlParseError(f"{kind} constraint modifiers must begin with an enforcement modifier")
+    if modifiers.enforcement in {"ENFORCED", "NOT ENFORCED"} and modifiers.validation is not None:
+        raise DdlParseError(
+            f"{kind} constraint modifiers cannot combine ENFORCED/NOT ENFORCED "
+            "with a validation modifier"
+        )
+    if modifiers.validation == "VALIDATE":
+        raise DdlParseError(f"{kind} constraint modifiers do not support VALIDATE")
+    if kind == "DEFAULT":
+        if modifiers.validation is not None or modifiers.reliance is not None:
+            raise DdlParseError(
+                "DEFAULT constraint modifiers support only ENABLE, ENFORCED, or DISABLE"
+            )
+        if modifiers.enforcement == "NOT ENFORCED":
+            raise DdlParseError(
+                "DEFAULT constraint modifiers support only ENABLE, ENFORCED, or DISABLE"
+            )
+    elif kind in {"PRIMARY KEY", "UNIQUE", "FOREIGN KEY"} and modifiers.enforcement not in {
+        "DISABLE",
+        "NOT ENFORCED",
+    }:
+        raise DdlParseError(f"{kind} constraint modifiers must use DISABLE or NOT ENFORCED")
+    return match.end()
 
 
-def _column_constraint_end(value: str) -> int:
-    """Parse exactly one optional-name Hive column constraint."""
+def _optional_constraint_name(value: str) -> tuple[str | None, int]:
     index = 0
-    prefix = re.match(rf"CONSTRAINT\s+{_IDENTIFIER}\s+", value, flags=re.IGNORECASE)
+    prefix = re.match(
+        rf"CONSTRAINT\s+(?P<name>{_IDENTIFIER})\s+",
+        value,
+        flags=re.IGNORECASE,
+    )
     if prefix:
-        index = prefix.end()
+        return _validated_constraint_name(prefix.group("name")), prefix.end()
     elif re.match(r"CONSTRAINT\b", value, flags=re.IGNORECASE):
         raise DdlParseError("malformed named column constraint")
+    return None, index
+
+
+def _column_constraint(value: str, *, column_name: str) -> tuple[int, _Constraint]:
+    """Parse exactly one optional-name Hive column constraint."""
+    name, index = _optional_constraint_name(value)
 
     remaining = value[index:]
     match = re.match(r"NOT\s+NULL\b", remaining, flags=re.IGNORECASE)
     if match:
         end = index + match.end()
-        return _constraint_options_end(value, end)
+        end = _constraint_modifiers_end(value, end, kind="NOT NULL")
+        return end, _Constraint("NOT NULL", name, (column_name,))
 
     match = re.match(r"DEFAULT\b", remaining, flags=re.IGNORECASE)
     if match:
-        end = _default_value_end(value, index + match.end())
-        return _constraint_options_end(value, end, default=True)
+        default_value, end = _default_value_end(value, index + match.end())
+        if _java_string_length(default_value.expression) > _MAX_DEFAULT_VALUE_LENGTH:
+            raise DdlParseError(
+                f"DEFAULT value exceeds the supported length of {_MAX_DEFAULT_VALUE_LENGTH}"
+            )
+        end = _constraint_modifiers_end(value, end, kind="DEFAULT")
+        return end, _Constraint("DEFAULT", name, (column_name,), default_value)
 
     match = re.match(r"CHECK\b", remaining, flags=re.IGNORECASE)
     if match:
@@ -636,10 +882,16 @@ def _column_constraint_end(value: str) -> int:
             "CHECK constraints are unsupported because expressions are not parsed safely"
         )
 
-    match = re.match(r"(?:PRIMARY\s+KEY|UNIQUE)\b", remaining, flags=re.IGNORECASE)
+    match = re.match(
+        r"(?P<kind>PRIMARY\s+KEY|UNIQUE)\b",
+        remaining,
+        flags=re.IGNORECASE,
+    )
     if match:
+        kind = "PRIMARY KEY" if match.group("kind").upper().startswith("PRIMARY") else "UNIQUE"
         end = index + match.end()
-        return _constraint_options_end(value, end)
+        end = _constraint_modifiers_end(value, end, kind=kind)
+        return end, _Constraint(kind, name, (column_name,))
 
     match = re.match(
         rf"REFERENCES\s+{_IDENTIFIER}(?:\s*\.\s*{_IDENTIFIER})?",
@@ -655,7 +907,8 @@ def _column_constraint_end(value: str) -> int:
         identifiers = _identifier_list(target_columns, label="REFERENCES")
         if len(identifiers) != 1:
             raise DdlParseError("a column REFERENCES constraint must name one target column")
-        return _constraint_options_end(value, end)
+        end = _constraint_modifiers_end(value, end, kind="FOREIGN KEY")
+        return end, _Constraint("FOREIGN KEY", name, (column_name,))
 
     raise DdlParseError("unsupported or malformed column constraint")
 
@@ -663,20 +916,22 @@ def _column_constraint_end(value: str) -> int:
 def _parse_column_clauses(
     value: str,
     *,
+    column_name: str,
     allow_constraints: bool = True,
-) -> str | None:
+) -> tuple[str | None, _Constraint | None]:
     """Validate one optional constraint followed by one optional COMMENT."""
     remaining = value.strip()
     comment: str | None = None
+    constraint: _Constraint | None = None
     if not remaining:
-        return None
+        return None, None
 
     if not re.match(r"COMMENT\b", remaining, flags=re.IGNORECASE):
         if not allow_constraints:
             raise DdlParseError(
                 "PARTITIONED BY columns may contain only a data type and optional COMMENT"
             )
-        end = _column_constraint_end(remaining)
+        end, constraint = _column_constraint(remaining, column_name=column_name)
         remaining = remaining[end:].strip()
 
     if re.match(r"COMMENT\b", remaining, flags=re.IGNORECASE):
@@ -688,10 +943,12 @@ def _parse_column_clauses(
             raise DdlParseError(
                 "PARTITIONED BY columns may contain only a data type and optional COMMENT"
             )
+        if constraint is not None and constraint.kind == "DEFAULT":
+            raise DdlParseError("unsupported or malformed DEFAULT value or modifiers")
         raise DdlParseError(
             "a column may contain only one constraint followed by an optional COMMENT"
         )
-    return comment
+    return comment, constraint
 
 
 def _consume_keyword(value: str, pattern: str, *, label: str) -> int:
@@ -755,6 +1012,8 @@ def _validate_skewed_values(value: str, *, column_count: int) -> None:
 
 def _parse_table_tail(
     value: str,
+    *,
+    max_columns: int | None = None,
 ) -> tuple[tuple[Column, ...], str | None, tuple[_StructuralReference, ...]]:
     """Validate table clauses and retain structural column references."""
     remaining = value.strip()
@@ -793,6 +1052,7 @@ def _parse_table_tail(
             partition_columns, _ = _columns(
                 contents,
                 allow_constraints=False,
+                max_columns=max_columns,
             )
             remaining = remaining[end:].strip()
             continue
@@ -1048,15 +1308,17 @@ def _parse_table_tail(
     return partition_columns, table_comment, tuple(references)
 
 
-def _validate_table_constraint(definition: str) -> tuple[_StructuralReference, ...]:
-    """Validate one table constraint and retain its local structural references."""
+def _validate_table_constraint(definition: str) -> _Constraint:
+    """Validate one table constraint and retain its identity and local columns."""
     index = 0
     prefix = re.match(
-        rf"CONSTRAINT\s+{_IDENTIFIER}\s+",
+        rf"CONSTRAINT\s+(?P<name>{_IDENTIFIER})\s+",
         definition,
         flags=re.IGNORECASE,
     )
+    name: str | None = None
     if prefix:
+        name = _validated_constraint_name(prefix.group("name"))
         index = prefix.end()
     elif re.match(r"CONSTRAINT\b", definition, flags=re.IGNORECASE):
         raise DdlParseError("malformed named table constraint")
@@ -1070,11 +1332,11 @@ def _validate_table_constraint(definition: str) -> tuple[_StructuralReference, .
             label=match.group("kind").upper(),
         )
         identifiers = _identifier_list(columns, label=match.group("kind").upper())
-        options_end = _constraint_options_end(definition, end)
+        label = "PRIMARY KEY" if match.group("kind").upper().startswith("PRIMARY") else "UNIQUE"
+        options_end = _constraint_modifiers_end(definition, end, kind=label)
         if definition[options_end:].strip():
             raise DdlParseError("unsupported or malformed table constraint modifiers")
-        label = "PRIMARY KEY" if match.group("kind").upper().startswith("PRIMARY") else "UNIQUE"
-        return ((label, identifiers),)
+        return _Constraint(label, name, identifiers)
 
     match = re.match(r"FOREIGN\s+KEY\b", remaining, flags=re.IGNORECASE)
     if match:
@@ -1102,10 +1364,10 @@ def _validate_table_constraint(definition: str) -> tuple[_StructuralReference, .
         )
         if len(local_identifiers) != len(target_identifiers):
             raise DdlParseError("FOREIGN KEY and REFERENCES column lists must have matching arity")
-        options_end = _constraint_options_end(definition, target_end)
+        options_end = _constraint_modifiers_end(definition, target_end, kind="FOREIGN KEY")
         if definition[options_end:].strip():
             raise DdlParseError("unsupported or malformed table constraint modifiers")
-        return (("FOREIGN KEY", local_identifiers),)
+        return _Constraint("FOREIGN KEY", name, local_identifiers)
 
     match = re.match(r"CHECK\b", remaining, flags=re.IGNORECASE)
     if match:
@@ -1349,13 +1611,39 @@ def _validate_type(data_type: str) -> None:
     _TypeParser(data_type).parse()
 
 
+def _validate_default_value(
+    column_name: str,
+    column_type: str,
+    default_value: _DefaultValue,
+) -> None:
+    canonical_column_type = _canonical_primitive_type(column_type)
+    if canonical_column_type is None:
+        raise DdlParseError(
+            f"DEFAULT is not supported for complex or unrecognized type of column {column_name!r}"
+        )
+    if default_value.is_null:
+        raise DdlParseError(
+            f"bare NULL DEFAULT has no exact type for column {column_name!r}; use an explicit CAST"
+        )
+    if default_value.data_type is None:
+        raise DdlParseError(
+            f"cannot verify the exact DEFAULT type for column {column_name!r}; use an explicit CAST"
+        )
+    if default_value.data_type != canonical_column_type:
+        raise DdlParseError(
+            f"DEFAULT type {default_value.data_type} is incompatible with "
+            f"column {column_name!r} type {canonical_column_type}"
+        )
+
+
 def _columns(
     column_list: str,
     *,
     allow_constraints: bool = True,
-) -> tuple[tuple[Column, ...], tuple[_StructuralReference, ...]]:
+    max_columns: int | None = None,
+) -> tuple[tuple[Column, ...], tuple[_Constraint, ...]]:
     columns: list[Column] = []
-    references: list[_StructuralReference] = []
+    constraints: list[_Constraint] = []
     for raw_definition in _top_level_parts(column_list):
         definition = raw_definition.strip()
         if not definition:
@@ -1364,28 +1652,68 @@ def _columns(
         if first_word in _NON_COLUMN_PREFIXES:
             if not allow_constraints:
                 raise DdlParseError("PARTITIONED BY must contain only column definitions")
-            references.extend(_validate_table_constraint(definition))
+            constraints.append(_validate_table_constraint(definition))
             continue
+        if max_columns is not None and len(columns) >= max_columns:
+            raise DdlColumnLimitError("DDL column count exceeds the supported limit")
         match = _COLUMN.match(definition)
         if match is None:
             raise DdlParseError("cannot parse a column definition")
-        data_type, comment = _split_column_clauses(
+        column_name = _unquote(match.group("name"))
+        data_type, comment, constraint = _split_column_clauses(
             match.group("type"),
+            column_name=column_name,
             allow_constraints=allow_constraints,
         )
         if not data_type:
             raise DdlParseError("a column is missing its data type")
         _validate_type(data_type)
+        if constraint is not None:
+            if constraint.default_value is not None:
+                _validate_default_value(column_name, data_type, constraint.default_value)
+            constraints.append(constraint)
         columns.append(
             Column(
-                name=_unquote(match.group("name")),
+                name=column_name,
                 data_type=data_type,
                 comment=comment,
             )
         )
     if not columns:
         raise DdlParseError("CREATE TABLE must define at least one column")
-    return tuple(columns), tuple(references)
+    return tuple(columns), tuple(constraints)
+
+
+def _validate_constraint_state(
+    constraints: tuple[_Constraint, ...],
+    *,
+    external: bool,
+) -> None:
+    """Enforce table-wide constraint identity and cardinality rules."""
+    constraint_names: set[str] = set()
+    primary_key_seen = False
+    for constraint in constraints:
+        if constraint.name is not None:
+            comparison_name = _identifier_collision_key(constraint.name)
+            if comparison_name in constraint_names:
+                raise DdlParseError(f"duplicate constraint name {constraint.name!r}")
+            constraint_names.add(comparison_name)
+        if constraint.kind == "PRIMARY KEY":
+            if primary_key_seen:
+                raise DdlParseError("a table may define only one PRIMARY KEY constraint")
+            primary_key_seen = True
+        if external and constraint.kind == "DEFAULT":
+            raise DdlParseError("DEFAULT constraints are not supported on EXTERNAL tables")
+
+
+def _constraint_references(
+    constraints: tuple[_Constraint, ...],
+) -> tuple[_StructuralReference, ...]:
+    return tuple(
+        (constraint.kind, constraint.local_columns)
+        for constraint in constraints
+        if constraint.kind in {"PRIMARY KEY", "UNIQUE", "FOREIGN KEY"}
+    )
 
 
 def _validate_structural_references(
@@ -1393,25 +1721,33 @@ def _validate_structural_references(
     references: tuple[_StructuralReference, ...],
 ) -> None:
     """Resolve structural references against ordinary columns case-insensitively."""
-    ordinary_columns = {_identifier_comparison(column.name) for column in columns}
+    ordinary_columns = {_hive_identifier_key(column.name) for column in columns}
     for label, names in references:
         for name in names:
-            if _identifier_comparison(name) not in ordinary_columns:
+            if _hive_identifier_key(name) not in ordinary_columns:
                 raise DdlParseError(f"{label} references unknown ordinary column {name!r}")
 
 
-def parse_hive_ddl(sql: str) -> tuple[Table, ...]:
+def parse_hive_ddl(
+    sql: str,
+    *,
+    max_tables: int | None = None,
+    max_columns: int | None = None,
+) -> tuple[Table, ...]:
     """Parse all CREATE TABLE statements in a UTF-8 SQL document."""
     sql = sql.removeprefix("\ufeff")
     cleaned = _without_comments(sql)
     quoted = _quoted_character_mask(cleaned)
-    matches = [match for match in _CREATE_TABLE.finditer(cleaned) if not quoted[match.start()]]
-    if not matches:
-        raise DdlParseError("no Hive CREATE TABLE statement found")
-
     tables: list[Table] = []
+    column_count = 0
     cursor = 0
-    for match in matches:
+    matched = False
+    for match in _CREATE_TABLE.finditer(cleaned):
+        if quoted[match.start()]:
+            continue
+        matched = True
+        if max_tables is not None and len(tables) >= max_tables:
+            raise DdlTableLimitError("DDL table count exceeds the supported limit")
         prefix = cleaned[cursor : match.start()].strip(" \t\r\n;")
         if prefix:
             raise DdlParseError("only CREATE TABLE statements are supported")
@@ -1423,13 +1759,23 @@ def parse_hive_ddl(sql: str) -> tuple[Table, ...]:
             if cleaned[statement_end - 1 : statement_end] == ";"
             else statement_end
         )
-        columns, constraint_references = _columns(cleaned[opening + 1 : closing])
-        partition_columns, table_comment, tail_references = _parse_table_tail(
-            cleaned[closing + 1 : tail_end]
+        remaining_columns = None if max_columns is None else max_columns - column_count
+        columns, constraints = _columns(
+            cleaned[opening + 1 : closing],
+            max_columns=remaining_columns,
         )
+        column_count += len(columns)
+        remaining_columns = None if max_columns is None else max_columns - column_count
+        partition_columns, table_comment, tail_references = _parse_table_tail(
+            cleaned[closing + 1 : tail_end],
+            max_columns=remaining_columns,
+        )
+        column_count += len(partition_columns)
+        external = match.group("external") is not None
+        _validate_constraint_state(constraints, external=external)
         _validate_structural_references(
             columns,
-            constraint_references + tail_references,
+            _constraint_references(constraints) + tail_references,
         )
         database, name = _qualified_name(match.group("name"))
         tables.append(
@@ -1438,12 +1784,14 @@ def parse_hive_ddl(sql: str) -> tuple[Table, ...]:
                 name=name,
                 columns=columns,
                 partition_columns=partition_columns,
-                external=match.group("external") is not None,
+                external=external,
                 comment=table_comment,
                 create_sql=sql[match.start() : statement_end].strip(),
             )
         )
         cursor = statement_end
+    if not matched:
+        raise DdlParseError("no Hive CREATE TABLE statement found")
     if cleaned[cursor:].strip(" \t\r\n;"):
         raise DdlParseError("only CREATE TABLE statements are supported")
     return tuple(tables)
