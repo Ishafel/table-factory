@@ -393,6 +393,25 @@ def test_plain_decimal_default_uses_hive_decimal_type_inference() -> None:
         parse_hive_ddl("CREATE TABLE defaults (value DOUBLE DEFAULT 1.25);")
 
 
+@pytest.mark.parametrize(
+    "column_definition",
+    (
+        "value DECIMAL(3,0) DEFAULT 1E2BD",
+        "value DECIMAL(3,3) DEFAULT 1E-3BD",
+        "value DOUBLE DEFAULT 999999999999999999999999999999999999999",
+        "value DECIMAL(38,38) DEFAULT 0.123456789012345678901234567890123456789",
+        "value DECIMAL(38,38) DEFAULT 5E-39BD",
+        "value DECIMAL(1,0) DEFAULT 4E-39BD",
+        "value DECIMAL(38,0) DEFAULT 1E37BD",
+        "value DOUBLE DEFAULT 99999999999999999999999999999999999999.5",
+    ),
+)
+def test_numeric_default_inference_matches_hive_fallback_and_rounding(
+    column_definition: str,
+) -> None:
+    assert parse_hive_ddl(f"CREATE TABLE defaults ({column_definition});")[0].name == "defaults"
+
+
 def test_float_default_requires_an_explicit_cast() -> None:
     assert (
         parse_hive_ddl("CREATE TABLE defaults (value REAL DEFAULT CAST(1.25 AS FLOAT));")[0].name
@@ -436,6 +455,8 @@ def test_lowercase_double_suffix_matches_hive_numeric_fallback() -> None:
         "value INT DEFAULT CAST(1.0Y AS INT)",
         "value DATE DEFAULT CAST(DATE 'not-a-date' AS DATE)",
         "value TIMESTAMP DEFAULT CAST(TIMESTAMP '2024-99-99 25:61:61' AS TIMESTAMP)",
+        "value DECIMAL(38,0) DEFAULT 1E38BD",
+        "value DECIMAL(38,0) DEFAULT 99999999999999999999999999999999999999.5BD",
     ),
 )
 def test_default_literals_with_invalid_values_or_no_exact_type_are_rejected(
@@ -595,7 +616,7 @@ def test_constraint_names_and_primary_key_cardinality_are_table_wide(
         parse_hive_ddl(f"CREATE TABLE constrained ({columns});")
 
 
-def test_constraint_name_identity_uses_full_unicode_case_canonicalization() -> None:
+def test_constraint_name_identity_uses_hive_lowercasing() -> None:
     ddl = (
         "CREATE TABLE constrained ("
         "one INT, two INT,"
@@ -608,11 +629,43 @@ def test_constraint_name_identity_uses_full_unicode_case_canonicalization() -> N
         parse_hive_ddl(ddl)
 
 
+def test_constraint_name_identity_does_not_use_unicode_compatibility_folding() -> None:
+    ddl = (
+        "CREATE TABLE constrained ("
+        "one INT, two INT, three INT, four INT,"
+        "CONSTRAINT `Ｃ` UNIQUE (one) DISABLE,"
+        "CONSTRAINT C UNIQUE (two) DISABLE,"
+        "CONSTRAINT `ß` UNIQUE (three) DISABLE,"
+        "CONSTRAINT SS UNIQUE (four) DISABLE"
+        ");"
+    )
+
+    assert parse_hive_ddl(ddl)[0].name == "constrained"
+
+
 def test_constraint_name_and_default_value_lengths_match_hive_limits() -> None:
     long_name = "c" * 256
     with pytest.raises(DdlParseError, match=r"constraint name exceeds.*255"):
         parse_hive_ddl(
             f"CREATE TABLE constrained (id INT, CONSTRAINT {long_name} UNIQUE (id) DISABLE);"
+        )
+
+    lowered_boundary_name = "İ" * 127 + "A"
+    assert (
+        parse_hive_ddl(
+            "CREATE TABLE constrained ("
+            f"id INT, CONSTRAINT `{lowered_boundary_name}` UNIQUE (id) DISABLE"
+            ");"
+        )[0].name
+        == "constrained"
+    )
+
+    expanding_long_name = "İ" * 128
+    with pytest.raises(DdlParseError, match=r"constraint name exceeds.*255"):
+        parse_hive_ddl(
+            "CREATE TABLE constrained ("
+            f"id INT, CONSTRAINT `{expanding_long_name}` UNIQUE (id) DISABLE"
+            ");"
         )
 
     long_default = "x" * 256

@@ -7,6 +7,7 @@ import unicodedata
 from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import date, datetime
+from decimal import ROUND_HALF_UP, Decimal, InvalidOperation, localcontext
 
 from table_factory.errors import DdlColumnLimitError, DdlParseError, DdlTableLimitError
 from table_factory.models import Column, Table
@@ -139,8 +140,13 @@ def _java_string_length(value: str) -> int:
     return len(value.encode("utf-16-le", errors="surrogatepass")) // 2
 
 
+def _hive_constraint_name(value: str) -> str:
+    """Apply Hive's lowercase-only canonicalization for constraint names."""
+    return value.lower()
+
+
 def _validated_constraint_name(raw_name: str) -> str:
-    name = _unquote(raw_name)
+    name = _hive_constraint_name(_unquote(raw_name))
     if _java_string_length(name) > _MAX_CONSTRAINT_NAME_LENGTH:
         raise DdlParseError(
             f"constraint name exceeds the supported length of {_MAX_CONSTRAINT_NAME_LENGTH}"
@@ -667,7 +673,7 @@ def _infer_default_literal_type(expression: str) -> tuple[str | None, bool]:
     if "e" in unsigned.lower():
         return "DOUBLE", False
     if "." in unsigned:
-        return _decimal_literal_type(unsigned), False
+        return _decimal_literal_type(unsigned) or "DOUBLE", False
     try:
         number = int(unsigned)
     except ValueError:
@@ -676,7 +682,7 @@ def _infer_default_literal_type(expression: str) -> tuple[str | None, bool]:
         return "INT", False
     if number <= 2**63 - 1:
         return "BIGINT", False
-    return _decimal_literal_type(unsigned), False
+    return _decimal_literal_type(unsigned) or "DOUBLE", False
 
 
 def _valid_typed_default_literal(literal_type: str, literal: str) -> bool:
@@ -705,24 +711,57 @@ def _valid_typed_default_literal(literal_type: str, literal: str) -> bool:
 
 
 def _decimal_literal_type(value: str) -> str | None:
-    """Infer Hive DECIMAL precision/scale for a non-exponent numeric literal."""
+    """Create and normalize a HiveDecimal literal, returning its inferred type."""
     unsigned = value.lstrip("+-")
-    if "e" in unsigned.lower():
+    exponent_match = re.search(r"[Ee](?:[+-])?(?P<digits>[0-9]+)$", unsigned)
+    if exponent_match and len(exponent_match.group("digits").lstrip("0")) > 2:
+        # HiveDecimal's parser rejects exponent powers beyond its bounded
+        # precision/scale range before attempting normalization.
         return None
-    whole, separator, fraction = unsigned.partition(".")
-    if not separator:
-        fraction = ""
-    if not whole and not fraction:
+
+    try:
+        decimal_value = Decimal(unsigned)
+    except InvalidOperation:
         return None
-    significant_whole = whole.lstrip("0")
-    significant_fraction = fraction.rstrip("0")
-    if not significant_whole and not significant_fraction:
+    if not decimal_value.is_finite():
+        return None
+    if decimal_value.is_zero():
         return "DECIMAL(1,0)"
-    integer_digits = len(significant_whole)
-    scale = len(significant_fraction)
-    precision = integer_digits + scale if integer_digits else scale
-    if precision > 38 or scale > precision:
+
+    def decimal_shape(candidate: Decimal) -> tuple[int, int, int]:
+        decimal_tuple = candidate.as_tuple()
+        digits = list(decimal_tuple.digits)
+        exponent = decimal_tuple.exponent
+        assert isinstance(exponent, int)
+        while digits[-1] == 0:
+            digits.pop()
+            exponent += 1
+        if exponent >= 0:
+            precision = len(digits) + exponent
+            return precision, 0, precision
+        scale = -exponent
+        raw_precision = len(digits)
+        return max(raw_precision, scale), scale, raw_precision - scale
+
+    precision, scale, integer_digits = decimal_shape(decimal_value)
+    if integer_digits > 38:
         return None
+
+    maximum_scale = min(38, 38 - integer_digits, scale)
+    if scale > maximum_scale:
+        with localcontext() as context:
+            context.prec = max(len(decimal_value.as_tuple().digits), 40)
+            quantum = Decimal(1).scaleb(-maximum_scale)
+            try:
+                decimal_value = decimal_value.quantize(quantum, rounding=ROUND_HALF_UP)
+            except InvalidOperation:
+                return None
+        if decimal_value.is_zero():
+            return "DECIMAL(1,0)"
+        precision, scale, integer_digits = decimal_shape(decimal_value)
+        if integer_digits > 38 or precision > 38:
+            return None
+
     return f"DECIMAL({precision},{scale})"
 
 
@@ -1694,7 +1733,7 @@ def _validate_constraint_state(
     primary_key_seen = False
     for constraint in constraints:
         if constraint.name is not None:
-            comparison_name = _identifier_collision_key(constraint.name)
+            comparison_name = _hive_constraint_name(constraint.name)
             if comparison_name in constraint_names:
                 raise DdlParseError(f"duplicate constraint name {constraint.name!r}")
             constraint_names.add(comparison_name)

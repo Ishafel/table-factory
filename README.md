@@ -167,13 +167,18 @@ TBLPROPERTIES (
 
 После типа колонки допускается не более одного constraint (с необязательным
 `CONSTRAINT name`), затем — не более одного `COMMENT`. Имена constraints должны
-быть уникальны без учёта регистра, а `PRIMARY KEY` может быть только один на
-таблицу. Для `PRIMARY KEY`, `UNIQUE` и `FOREIGN KEY` разрешены только
+быть уникальны после Hive-compatible lowercase без Unicode compatibility
+normalization; лимит 255 UTF-16 code units проверяется после lowercase.
+`PRIMARY KEY` может быть только один на таблицу. Для `PRIMARY KEY`, `UNIQUE` и
+`FOREIGN KEY` разрешены только
 `DISABLE`/`NOT ENFORCED`; `VALIDATE` отклоняется. Для `DEFAULT` принимаются
 только type-compatible literals, `CURRENT_DATE`, `CURRENT_TIMESTAMP`,
 `CURRENT_USER()` и ограниченно вложенные `CAST` этих значений в primitive Hive
-type. Bare `NULL` не имеет точного типа и требует явного `CAST(NULL AS type)`;
-непроверяемая совместимость отклоняется fail-closed. `DEFAULT` запрещён у
+type. Numeric literals повторяют Hive inference: `BD` поддерживает exponent и
+HiveDecimal rounding до 38 digits, а непредставимый без suffix integer/decimal
+получает Hive fallback в `DOUBLE`. Bare `NULL` не имеет точного типа и требует
+явного `CAST(NULL AS type)`; непроверяемая совместимость отклоняется fail-closed.
+`DEFAULT` запрещён у
 `EXTERNAL` tables, а его допустимые modifiers —
 `ENABLE`, `ENFORCED` или `DISABLE`. `CHECK` намеренно отклоняется fail-closed,
 поскольку проект не реализует безопасный parser Hive expressions.
